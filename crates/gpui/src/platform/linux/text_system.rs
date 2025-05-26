@@ -1,7 +1,5 @@
 use crate::{
-    Bounds, DevicePixels, Font, FontFeatures, FontId, FontMetrics, FontRun, FontStyle, FontWeight,
-    GlyphId, LineLayout, Pixels, PlatformTextSystem, Point, RenderGlyphParams, SUBPIXEL_VARIANTS,
-    ShapedGlyph, ShapedRun, SharedString, Size, point, size,
+    point, size, Bounds, DevicePixels, Font, FontFeatures, FontId, FontMetrics, FontRun, FontStyle, FontWeight, GlyphId, LineLayout, Pixels, PlatformTextSystem, Point, RenderGlyphParams, Rgba, ShapedGlyph, ShapedRun, SharedString, Size, SUBPIXEL_VARIANTS
 };
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
@@ -10,6 +8,7 @@ use cosmic_text::{
     FontSystem, ShapeBuffer, ShapeLine, SwashCache,
 };
 
+use image::{buffer::ConvertBuffer, ImageBuffer};
 use itertools::Itertools;
 use parking_lot::RwLock;
 use pathfinder_geometry::{
@@ -17,7 +16,7 @@ use pathfinder_geometry::{
     vector::{Vector2F, Vector2I},
 };
 use smallvec::SmallVec;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, ops::ShlAssign, sync::Arc};
 
 pub(crate) struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
 
@@ -308,6 +307,10 @@ impl CosmicTextSystemState {
         params: &RenderGlyphParams,
         glyph_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+
+        use skia_safe::{ImageInfo, AlphaType, ColorSpace, SurfacePropsFlags,
+            SurfaceProps, surfaces, GlyphId, Color4f, Color, Paint, canvas::GlyphPositions, FontMgr, Font, Point};
+
         if glyph_bounds.size.width.0 == 0 || glyph_bounds.size.height.0 == 0 {
             anyhow::bail!("glyph bounds are empty");
         } else {
@@ -316,30 +319,82 @@ impl CosmicTextSystemState {
             let subpixel_shift = params
                 .subpixel_variant
                 .map(|v| v as f32 / (SUBPIXEL_VARIANTS as f32 * params.scale_factor));
-            let mut image = self
-                .swash_cache
-                .get_image(
-                    &mut self.font_system,
-                    CacheKey::new(
-                        font.id(),
-                        params.glyph_id.0 as u16,
-                        (params.font_size * params.scale_factor).into(),
-                        (subpixel_shift.x, subpixel_shift.y.trunc()),
-                        cosmic_text::CacheKeyFlags::empty(),
-                    )
-                    .0,
-                )
-                .clone()
-                .with_context(|| format!("no image for {params:?} in font {font:?}"))?;
 
-            if params.is_emoji {
-                // Convert from RGBA to BGRA.
-                for pixel in image.data.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                }
+        //<<<< SKIA
+            let size = params.font_size.0 * params.scale_factor;
+            let intsz = size.ceil() as i32;
+
+            let (w, h) = (glyph_bounds.size.width.0, glyph_bounds.size.height.0);
+            //let (w, h) = (intsz, 2*intsz);
+
+            let image_info = ImageInfo::new_n32((w, h),
+                                                 AlphaType::Opaque, Some(ColorSpace::new_srgb_linear()));
+
+            let surface_props = SurfaceProps::new(SurfacePropsFlags::empty(), skia_safe::PixelGeometry::RGBH);
+            let mut surface = surfaces::raster(&image_info, 0, Some(&surface_props))
+                .expect("Unable to create skia surface");
+            let canvas = surface.canvas();
+            // Clear canvas with white
+            canvas.clear(Color4f::new(0., 0., 0., 0.));
+
+            // Set up paint and font
+            let mut paint = Paint::default();
+            //paint.set_anti_alias(true);
+            //paint.set_dither(true);
+
+            //paint.set_color(params.color.swap_bytes());
+            paint.set_color(params.color.rotate_right(8));
+            //paint.set_color(params.color.rotate_right(8) | 0xFF000000);
+            //paint.set_color(params.color);
+            //paint.set_color(Color::RED);
+
+            // Load custom font from file
+            let font_mgr = FontMgr::default();
+            let typeface = font_mgr.new_from_data(font.data(), None)
+                                    .expect("Unable to create skia typeface");
+            let mut font = Font::from_typeface(typeface, size)
+                            .with_size(size)
+                            .expect("Unable to create skia font");
+
+            font.set_subpixel(true);
+            font.set_hinting(skia_safe::FontHinting::Full);
+            font.set_force_auto_hinting(true);
+            font.set_edging(skia_safe::font::Edging::SubpixelAntiAlias);
+
+            // Draw text
+            let glyph = GlyphId::from_le(params.glyph_id.0 as u16);
+            let offy = h + glyph_bounds.origin.y.0;
+            let offx = glyph_bounds.origin.x.0;
+            //let offset_pt = Point::new(-offx as f32 + subpixel_shift.x, -offy as f32 + subpixel_shift.y);
+            let offset_pt = Point::new(-offx as f32, -offy as f32);
+            canvas.draw_glyphs_at(&[glyph],
+                GlyphPositions::Points(&[offset_pt]), //glyph_bounds.origin.x.0 as f32, (2*glyph_bounds.origin.y.0) as f32
+                Point::new(-0., h as f32),
+                &font, &paint);
+
+            let mut img_data = surface.make_temporary_image()
+                .expect("Can't make temp image from surface")
+                .peek_pixels()
+                .expect("Can't peek pixels from temp image")
+                .bytes()
+                .expect("Can't get bytes from pixels")
+                .to_vec();
+
+        //SKIA >>>>
+            // if params.is_emoji {
+            //     // Convert from RGBA to BGRA.
+            //     for pixel in img_data.chunks_exact_mut(4) {
+            //         pixel.swap(0, 2);
+            //     }
+            // }
+            let maybe_img: Option<ImageBuffer<image::Rgba<u8>, Vec<u8>>> = ImageBuffer::from_raw(w as u32, h as u32, img_data.clone());
+            if let Some(img) = maybe_img {
+                let img: ImageBuffer<image::Rgb<u8>, Vec<u8>> = img.convert();
+                img.save(format!("/tmp/glyphs/glyph_{}_{intsz}_{}_{}.png", params.glyph_id.0, glyph_bounds.origin.x.0, glyph_bounds.origin.y.0))
+                    .expect("Can't save glyph as png");
             }
 
-            Ok((bitmap_size, image.data))
+            Ok((bitmap_size, img_data))
         }
     }
 

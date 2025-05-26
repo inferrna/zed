@@ -691,6 +691,7 @@ pub(crate) struct RenderGlyphParams {
     pub(crate) font_size: Pixels,
     pub(crate) subpixel_variant: Point<u8>,
     pub(crate) scale_factor: f32,
+    pub(crate) color: u32,
     pub(crate) is_emoji: bool,
 }
 
@@ -703,6 +704,7 @@ impl Hash for RenderGlyphParams {
         self.font_size.0.to_bits().hash(state);
         self.subpixel_variant.hash(state);
         self.scale_factor.to_bits().hash(state);
+        self.color.hash(state);
         self.is_emoji.hash(state);
     }
 }

@@ -2540,21 +2540,27 @@ impl Window {
         color: Hsla,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
+        let subpixel_variant = Point {
+            x: (origin.x.0.fract() * SUBPIXEL_VARIANTS as f32).floor() as u8,
+            y: (origin.y.0.fract() * SUBPIXEL_VARIANTS as f32).floor() as u8,
+        };
 
-        let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
-        let subpixel_variant = Point {
-            x: (glyph_origin.x.0.fract() * SUBPIXEL_VARIANTS as f32).floor() as u8,
-            y: (glyph_origin.y.0.fract() * SUBPIXEL_VARIANTS as f32).floor() as u8,
-        };
+        let color_l = (color.l*1.33).clamp(0.0, 1.0);
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
             font_size,
             subpixel_variant,
             scale_factor,
-            is_emoji: false,
+            color: Hsla{
+                        h: color.h,
+                        s: color.s,
+                        l: color_l,
+                        a: color.a
+                    }.to_rgb().into(),
+            is_emoji: true,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -2566,19 +2572,23 @@ impl Window {
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
+
             let bounds = Bounds {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
             };
             let content_mask = self.content_mask().scale(scale_factor);
-            self.next_frame.scene.insert_primitive(MonochromeSprite {
+            let opacity = self.element_opacity();
+
+            self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
                 pad: 0,
+                grayscale: false,
                 bounds,
+                corner_radii: Default::default(),
                 content_mask,
-                color: color.opacity(element_opacity),
                 tile,
-                transformation: TransformationMatrix::unit(),
+                opacity,
             });
         }
         Ok(())
@@ -2610,6 +2620,7 @@ impl Window {
             // We don't render emojis with subpixel variants.
             subpixel_variant: Default::default(),
             scale_factor,
+            color: 0,
             is_emoji: true,
         };
 
