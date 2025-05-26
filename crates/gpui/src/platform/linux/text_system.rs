@@ -328,7 +328,7 @@ impl CosmicTextSystemState {
             //let (w, h) = (intsz, 2*intsz);
 
             let image_info = ImageInfo::new_n32((w, h),
-                                                 AlphaType::Opaque, Some(ColorSpace::new_srgb_linear()));
+                                                 AlphaType::Opaque, Some(ColorSpace::new_srgb()));
 
             let surface_props = SurfaceProps::new(SurfacePropsFlags::empty(), skia_safe::PixelGeometry::RGBH);
             let mut surface = surfaces::raster(&image_info, 0, Some(&surface_props))
@@ -342,11 +342,8 @@ impl CosmicTextSystemState {
             //paint.set_anti_alias(true);
             //paint.set_dither(true);
 
-            //paint.set_color(params.color.swap_bytes());
-            paint.set_color(params.color.rotate_right(8));
-            //paint.set_color(params.color.rotate_right(8) | 0xFF000000);
-            //paint.set_color(params.color);
-            //paint.set_color(Color::RED);
+            paint.set_color(params.color.rotate_right(8)); //RGBA -> ARGB conversion for skia
+
 
             // Load custom font from file
             let font_mgr = FontMgr::default();
@@ -365,8 +362,8 @@ impl CosmicTextSystemState {
             let glyph = GlyphId::from_le(params.glyph_id.0 as u16);
             let offy = h + glyph_bounds.origin.y.0;
             let offx = glyph_bounds.origin.x.0;
-            //let offset_pt = Point::new(-offx as f32 + subpixel_shift.x, -offy as f32 + subpixel_shift.y);
-            let offset_pt = Point::new(-offx as f32, -offy as f32);
+            let offset_pt = Point::new(-offx as f32 - subpixel_shift.x, -offy as f32 - subpixel_shift.y);
+            //let offset_pt = Point::new(-offx as f32, -offy as f32);
             canvas.draw_glyphs_at(&[glyph],
                 GlyphPositions::Points(&[offset_pt]), //glyph_bounds.origin.x.0 as f32, (2*glyph_bounds.origin.y.0) as f32
                 Point::new(-0., h as f32),

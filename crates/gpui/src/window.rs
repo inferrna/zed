@@ -2547,20 +2547,14 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
-        let color_l = (color.l*1.33).clamp(0.0, 1.0);
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
             font_size,
             subpixel_variant,
             scale_factor,
-            color: Hsla{
-                        h: color.h,
-                        s: color.s,
-                        l: color_l,
-                        a: color.a
-                    }.to_rgb().into(),
-            is_emoji: true,
+            color: color.to_rgb().into(),
+            is_emoji: true, //Otherwise it will be threatened as a grayscale image
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
