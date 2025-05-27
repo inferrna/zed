@@ -307,7 +307,8 @@ impl CosmicTextSystemState {
 
     fn calc_bounds(&self, glyph: u16, skia_font: &skia_safe::Font, skia_paint: &skia_safe::Paint) -> Bounds<DevicePixels> {
         let mut glyph_rects = vec![skia_safe::Rect::new_empty()];
-        skia_font.get_bounds(&[glyph], &mut glyph_rects, Some(skia_paint));
+        //skia_font.get_bounds(&[glyph], &mut glyph_rects, Some(skia_paint));
+        skia_font.get_bounds(&[glyph], &mut glyph_rects, None);
         Bounds {
             origin: crate::geometry::Point {
                 x: (glyph_rects[0].left.floor() as i32).into(),
@@ -315,9 +316,19 @@ impl CosmicTextSystemState {
             },
             size: crate::geometry::Size {
                 width: (glyph_rects[0].width().ceil() as i32).into(),
-                height: (glyph_rects[0].height().ceil() as i32).into(),
+                height: (glyph_rects[0].height().ceil().max(skia_font.size()) as i32).into(),
             }
         }
+        // Bounds {
+        //     origin: crate::geometry::Point {
+        //         x: 0.into(),
+        //         y: 0.into(),
+        //     },
+        //     size: crate::geometry::Size {
+        //         width: (skia_font.size().ceil() as i32).into(),
+        //         height: (2*skia_font.size().ceil() as i32).into(),
+        //     }
+        // }
     }
 
     fn raster_bounds(&mut self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
@@ -358,8 +369,8 @@ impl CosmicTextSystemState {
         let glyph_bounds = self.calc_bounds(glyph, &skia_font, &paint);
 
 
-        //paint.set_color(params.color.rotate_right(8)); //RGBA -> ARGB conversion for skia
-        paint.set_color(Color::WHITE);
+        paint.set_color(params.color.rotate_right(8)); //RGBA -> ARGB conversion for skia
+        //paint.set_color(Color::WHITE);
 
         let size = params.font_size.0 * params.scale_factor;
         let intsz = size.ceil() as i32;
@@ -387,7 +398,7 @@ impl CosmicTextSystemState {
         // Draw text
         let offy = glyph_bounds.origin.y.0;
         let offx = glyph_bounds.origin.x.0;
-        let offset_pt = Point::new(-offx as f32 - subpixel_shift.x, -offy as f32 - subpixel_shift.y);
+        let offset_pt = Point::new(-offx as f32 + subpixel_shift.x, -offy as f32 + subpixel_shift.y);
         //let offset_pt = Point::new(-offx as f32, -offy as f32);
 
         canvas.draw_glyphs_at(&[glyph],
@@ -395,7 +406,8 @@ impl CosmicTextSystemState {
             Point::new(0., h as f32),
             &skia_font, &paint);
 
-        let mut img_data = surface.make_temporary_image()
+        let mut img_data = surface
+            .make_temporary_image()
             .expect("Can't make temp image from surface")
             .peek_pixels()
             .expect("Can't peek pixels from temp image")
@@ -414,7 +426,7 @@ impl CosmicTextSystemState {
         let maybe_img: Option<ImageBuffer<image::Rgba<u8>, Vec<u8>>> = ImageBuffer::from_raw(w as u32, h as u32, img_data.clone());
         if let Some(img) = maybe_img {
             let img: ImageBuffer<image::Rgb<u8>, Vec<u8>> = img.convert();
-            img.save(format!("/tmp/glyphs/glyph_{}_{intsz}_{offy}_{offx}.png", params.glyph_id.0))
+            img.save(format!("/tmp/glyphs/glyph_{}_{intsz}_{offx}_{offy}.png", params.glyph_id.0))
                 .expect("Can't save glyph as png");
         }
 
