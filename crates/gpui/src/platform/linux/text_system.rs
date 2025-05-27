@@ -16,7 +16,7 @@ use pathfinder_geometry::{
     vector::{Vector2F, Vector2I},
 };
 use smallvec::SmallVec;
-use std::{borrow::Cow, ops::ShlAssign, sync::Arc};
+use std::{borrow::Cow, ops::ShlAssign, sync::{Arc, Mutex}};
 
 pub(crate) struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
 
@@ -35,6 +35,7 @@ impl FontKey {
 struct CosmicTextSystemState {
     skia_cache: HashMap<RenderGlyphParams, Vec<u8>>,
     bounds_cache: HashMap<RenderGlyphParams, Bounds<DevicePixels>>,
+    skia_fonts_cache: HashMap<(FontId, u32), skia_safe::Font>,
     font_system: FontSystem,
     scratch: ShapeBuffer,
     /// Contains all already loaded fonts, including all faces. Indexed by `FontId`.
@@ -57,8 +58,9 @@ impl CosmicTextSystem {
 
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
-            skia_cache: HashMap::default(),
-            bounds_cache: HashMap::default(),
+            skia_cache: Default::default(),
+            bounds_cache: Default::default(),
+            skia_fonts_cache: Default::default(),
             scratch: ShapeBuffer::default(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
@@ -276,11 +278,15 @@ impl CosmicTextSystemState {
         }
     }
 
-    fn skia_font(&self, params: &RenderGlyphParams) -> skia_safe::Font {
+    fn skia_font(&mut self, params: &RenderGlyphParams) -> skia_safe::Font {
         use skia_safe::{canvas::GlyphPositions, surfaces, AlphaType, Color, ColorSpace, Font, FontMgr,
             GlyphId, Handle, ImageInfo, Paint, Point, SurfaceProps, SurfacePropsFlags};
 
         let size = params.font_size.0 * params.scale_factor;
+        if let Some(font) = self.skia_fonts_cache.get(&(params.font_id, size.to_bits())).cloned() {
+            return font;
+        }
+
         let font_mgr = FontMgr::default();
         let font = &self.loaded_fonts[params.font_id.0].font;
         let typeface = font_mgr.new_from_data(font.data(), None)
@@ -293,6 +299,7 @@ impl CosmicTextSystemState {
         skia_font.set_hinting(skia_safe::FontHinting::Full);
         skia_font.set_force_auto_hinting(true);
         skia_font.set_edging(skia_safe::font::Edging::SubpixelAntiAlias);
+        self.skia_fonts_cache.insert((params.font_id, size.to_bits()), skia_font.clone());
         skia_font
     }
 
@@ -307,16 +314,18 @@ impl CosmicTextSystemState {
 
     fn calc_bounds(&self, glyph: u16, skia_font: &skia_safe::Font, skia_paint: &skia_safe::Paint) -> Bounds<DevicePixels> {
         let mut glyph_rects = vec![skia_safe::Rect::new_empty()];
-        //skia_font.get_bounds(&[glyph], &mut glyph_rects, Some(skia_paint));
-        skia_font.get_bounds(&[glyph], &mut glyph_rects, None);
+        skia_font.get_bounds(&[glyph], &mut glyph_rects, Some(skia_paint));
+        //skia_font.get_bounds(&[glyph], &mut glyph_rects, None);
+        let w = 1+glyph_rects[0].width().ceil() as i32;
+        let h = 1+glyph_rects[0].height().ceil() as i32;//.max(skia_font.size())
         Bounds {
             origin: crate::geometry::Point {
                 x: (glyph_rects[0].left.floor() as i32).into(),
-                y: (glyph_rects[0].bottom.floor() as i32).into(),
+                y: (glyph_rects[0].bottom.floor() as i32 - h).into(),
             },
             size: crate::geometry::Size {
-                width: (glyph_rects[0].width().ceil() as i32).into(),
-                height: (glyph_rects[0].height().ceil().max(skia_font.size()) as i32).into(),
+                width: w.into(), //
+                height: h.into(),
             }
         }
         // Bounds {
@@ -396,9 +405,9 @@ impl CosmicTextSystemState {
         canvas.clear(Color::new(0));
 
         // Draw text
-        let offy = glyph_bounds.origin.y.0;
+        let offy = h + glyph_bounds.origin.y.0;
         let offx = glyph_bounds.origin.x.0;
-        let offset_pt = Point::new(-offx as f32 + subpixel_shift.x, -offy as f32 + subpixel_shift.y);
+        let offset_pt = Point::new(-offx as f32 - subpixel_shift.x, -offy as f32 - subpixel_shift.y);
         //let offset_pt = Point::new(-offx as f32, -offy as f32);
 
         canvas.draw_glyphs_at(&[glyph],
@@ -423,12 +432,12 @@ impl CosmicTextSystemState {
         // }
 
         // For debug
-        let maybe_img: Option<ImageBuffer<image::Rgba<u8>, Vec<u8>>> = ImageBuffer::from_raw(w as u32, h as u32, img_data.clone());
-        if let Some(img) = maybe_img {
-            let img: ImageBuffer<image::Rgb<u8>, Vec<u8>> = img.convert();
-            img.save(format!("/tmp/glyphs/glyph_{}_{intsz}_{offx}_{offy}.png", params.glyph_id.0))
-                .expect("Can't save glyph as png");
-        }
+        // let maybe_img: Option<ImageBuffer<image::Rgba<u8>, Vec<u8>>> = ImageBuffer::from_raw(w as u32, h as u32, img_data.clone());
+        // if let Some(img) = maybe_img {
+        //     let img: ImageBuffer<image::Rgb<u8>, Vec<u8>> = img.convert();
+        //     img.save(format!("/tmp/glyphs/glyph_{}_{intsz}_{offx}_{offy}.png", params.glyph_id.0))
+        //         .expect("Can't save glyph as png");
+        // }
 
         let bitmap_size = glyph_bounds.size;
 
