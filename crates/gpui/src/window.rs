@@ -2557,8 +2557,9 @@ impl Window {
             is_emoji: true, //Otherwise it will be threatened as a grayscale image
         };
 
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if !raster_bounds.is_zero() {
+        let maybe_raster_bounds = self.text_system().raster_bounds(&params);
+        //let zero_bounds = raster_bounds
+        if !maybe_raster_bounds.as_ref().map(|b| b.is_zero()).unwrap_or(false) {
             let tile = self
                 .sprite_atlas
                 .get_or_insert_with(&params.clone().into(), &mut || {
@@ -2566,6 +2567,8 @@ impl Window {
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
+
+            let raster_bounds = maybe_raster_bounds.unwrap_or_else(|_| self.text_system().raster_bounds(&params).unwrap());
 
             let bounds = Bounds {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),

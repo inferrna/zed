@@ -287,9 +287,11 @@ impl TextSystem {
         if let Some(bounds) = raster_bounds.get(params) {
             Ok(*bounds)
         } else {
-            let mut raster_bounds = RwLockUpgradableReadGuard::upgrade(raster_bounds);
             let bounds = self.platform_text_system.glyph_raster_bounds(params)?;
-            raster_bounds.insert(params.clone(), bounds);
+            let mut bparams = params.clone();
+            bparams.color = 0;
+            let mut raster_bounds = RwLockUpgradableReadGuard::upgrade(raster_bounds);
+            raster_bounds.insert(bparams, bounds);
             Ok(bounds)
         }
     }
@@ -298,9 +300,8 @@ impl TextSystem {
         &self,
         params: &RenderGlyphParams,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        let raster_bounds = self.raster_bounds(params)?;
         self.platform_text_system
-            .rasterize_glyph(params, raster_bounds)
+            .rasterize_glyph(params)
     }
 }
 
