@@ -510,7 +510,6 @@ pub(crate) trait PlatformTextSystem: Send + Sync {
     fn rasterize_glyph(
         &self,
         params: &RenderGlyphParams,
-        raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)>;
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout;
 }
@@ -582,9 +581,8 @@ impl PlatformTextSystem for NoopTextSystem {
     fn rasterize_glyph(
         &self,
         _params: &RenderGlyphParams,
-        raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        Ok((raster_bounds.size, Vec::new()))
+        Ok(Default::default())
     }
 
     fn layout_line(&self, text: &str, font_size: Pixels, _runs: &[FontRun]) -> LineLayout {

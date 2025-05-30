@@ -18,6 +18,8 @@ use pathfinder_geometry::{
 };
 use smallvec::SmallVec;
 use std::{borrow::Cow, sync::Arc};
+use swash::scale::{ScaleContext, image::Image, Source, Render, StrikeWith};
+use swash::zeno::{Format};
 
 pub(crate) struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
 
@@ -34,7 +36,8 @@ impl FontKey {
 }
 
 struct CosmicTextSystemState {
-    swash_cache: SwashCache,
+    swash_cache: HashMap<RenderGlyphParams, Image>,
+    bounds_cache: HashMap<RenderGlyphParams, Bounds<DevicePixels>>,
     font_system: FontSystem,
     scratch: ShapeBuffer,
     /// Contains all already loaded fonts, including all faces. Indexed by `FontId`.
@@ -57,7 +60,8 @@ impl CosmicTextSystem {
 
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
-            swash_cache: SwashCache::new(),
+            swash_cache: Default::default(),
+            bounds_cache: Default::default(),
             scratch: ShapeBuffer::default(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
@@ -175,9 +179,8 @@ impl PlatformTextSystem for CosmicTextSystem {
     fn rasterize_glyph(
         &self,
         params: &RenderGlyphParams,
-        raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        self.0.write().rasterize_glyph(params, raster_bounds)
+        self.0.write().rasterize_glyph(params)
     }
 
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
@@ -277,70 +280,118 @@ impl CosmicTextSystemState {
     }
 
     fn raster_bounds(&mut self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        let font = &self.loaded_fonts[params.font_id.0].font;
-        let subpixel_shift = params
-            .subpixel_variant
-            .map(|v| v as f32 / (SUBPIXEL_VARIANTS as f32 * params.scale_factor));
-        let image = self
-            .swash_cache
-            .get_image(
-                &mut self.font_system,
-                CacheKey::new(
-                    font.id(),
-                    params.glyph_id.0 as u16,
-                    (params.font_size * params.scale_factor).into(),
-                    (subpixel_shift.x, subpixel_shift.y.trunc()),
-                    cosmic_text::CacheKeyFlags::empty(),
-                )
-                .0,
-            )
-            .clone()
-            .with_context(|| format!("no image for {params:?} in font {font:?}"))?;
-        Ok(Bounds {
-            origin: point(image.placement.left.into(), (-image.placement.top).into()),
-            size: size(image.placement.width.into(), image.placement.height.into()),
-        })
+        let mut bparams = params.clone();
+        bparams.color = 0;
+        let bounds = self
+            .bounds_cache
+            .get(&bparams)
+            .cloned()
+            .with_context(|| format!("no bounds for {bparams:?} in font {:?}", params.font_id))?;
+        Ok(bounds)
     }
+
 
     #[profiling::function]
     fn rasterize_glyph(
         &mut self,
         params: &RenderGlyphParams,
-        glyph_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        if glyph_bounds.size.width.0 == 0 || glyph_bounds.size.height.0 == 0 {
-            anyhow::bail!("glyph bounds are empty");
-        } else {
-            let bitmap_size = glyph_bounds.size;
-            let font = &self.loaded_fonts[params.font_id.0].font;
-            let subpixel_shift = params
-                .subpixel_variant
-                .map(|v| v as f32 / (SUBPIXEL_VARIANTS as f32 * params.scale_factor));
-            let mut image = self
-                .swash_cache
-                .get_image(
-                    &mut self.font_system,
-                    CacheKey::new(
-                        font.id(),
-                        params.glyph_id.0 as u16,
-                        (params.font_size * params.scale_factor).into(),
-                        (subpixel_shift.x, subpixel_shift.y.trunc()),
-                        cosmic_text::CacheKeyFlags::empty(),
-                    )
-                    .0,
-                )
-                .clone()
-                .with_context(|| format!("no image for {params:?} in font {font:?}"))?;
 
-            if params.is_emoji {
-                // Convert from RGBA to BGRA.
-                for pixel in image.data.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                }
-            }
-
-            Ok((bitmap_size, image.data))
+        fn int_pixel2float(pixel: &[u8; 4]) -> [f32; 4] {
+            [pixel[0] as f32 / 255.0, pixel[1] as f32 / 255.0, pixel[2] as f32 / 255.0, pixel[3] as f32 / 255.0]
         }
+        fn float_pixel2int(pixel: &[f32; 4]) -> [u8; 4] {
+            [(pixel[0]*255.0).round() as u8,(pixel[1]*255.0).round() as u8,(pixel[2]*255.0).round() as u8,(pixel[3]*255.0).round() as u8]
+        }
+        fn correct_subpixel(color: &[f32; 4], subpixel: &mut [u8; 4], alpha: u8) {
+            let alpha_f = alpha as f32 / 255.0;
+            let mut res = [0f32; 4];
+            res[0] = color[0] * alpha_f + (1.0 - color[3] * alpha_f) * 0.5;
+            res[1] = color[1] * alpha_f + (1.0 - color[3] * alpha_f) * 0.5;
+            res[2] = color[2] * alpha_f + (1.0 - color[3] * alpha_f) * 0.5;
+            res[3] = color[3] * alpha_f + (1.0 - color[3] * alpha_f) * 0.5;
+            *subpixel = float_pixel2int(&res);
+        }
+
+        let font = &self.loaded_fonts[params.font_id.0].font;
+        let subpixel_shift = params
+            .subpixel_variant
+            .map(|v| v as f32 / (SUBPIXEL_VARIANTS as f32 * params.scale_factor));
+        if let Some(image) = self.swash_cache.get(params).cloned() {
+            let bounds: Bounds<DevicePixels> = Bounds {
+                origin: point(image.placement.left.into(), (-image.placement.top).into()),
+                size: size(image.placement.width.into(), image.placement.height.into()),
+            };
+            return Ok((bounds.size, image.data))
+        }
+
+        let font = self.loaded_fonts[params.font_id.0].font.as_swash();
+        // Create a font cache and shape context
+        let mut context = ScaleContext::new();
+
+        // Text to shape
+        let font_size = (params.font_size * params.scale_factor).into();
+        let glyph_id = params.glyph_id.0 as u16;
+
+        let mut scaler_alpha = context
+            .builder(font)
+            .size(font_size)
+            .hint(true)
+            .build();
+
+        let img_alpha = Render::new(&[
+            Source::Outline,
+        ])
+        .format(Format::Alpha)
+        .render(&mut scaler_alpha, glyph_id)
+        .unwrap();
+
+        let mut scaler_mask = context
+            .builder(font)
+            .size(font_size)
+            .hint(true)
+            .build();
+
+
+        // Select our source order
+        let mut img = Render::new(&[
+            Source::Outline,
+            Source::Bitmap(StrikeWith::BestFit),
+            Source::ColorBitmap(StrikeWith::BestFit),
+            Source::ColorOutline(0),
+        ])
+        // Select a subpixel format
+        //.format(Format::subpixel_bgra())
+        .format(Format::Subpixel)
+        // Render the image
+        .render(&mut scaler_mask, glyph_id)
+        .unwrap();
+
+        let color_bytes = params.color.to_ne_bytes();
+        let color_float = [color_bytes[0] as f32 / 255.0,
+                           color_bytes[1] as f32 / 255.0,
+                           color_bytes[2] as f32 / 255.0,
+                           color_bytes[3] as f32 / 255.0];
+
+        for (i, chunk) in img.data.chunks_mut(4).enumerate() {
+            //correct_subpixel(&[1.0, 1.0, 1.0, 1.0], chunk.try_into().unwrap());
+            correct_subpixel(&color_float, chunk.try_into().unwrap(), img_alpha.data[i]);
+        }
+
+        let bounds: Bounds<DevicePixels> = Bounds {
+            origin: point(img.placement.left.into(), (-img.placement.top).into()),
+            size: size(img.placement.width.into(), img.placement.height.into()),
+        };
+        let just_size = bounds.size.clone();
+
+        let mut bparams = params.clone();
+        bparams.color = 0;
+        self.bounds_cache.insert(bparams, bounds);
+        let data = img.data.clone();
+        self.swash_cache.insert(params.clone(), img);
+
+        return Ok((just_size, data))
+
     }
 
     /// This is used when cosmic_text has chosen a fallback font instead of using the requested

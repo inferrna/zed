@@ -2554,11 +2554,12 @@ impl Window {
             font_size,
             subpixel_variant,
             scale_factor,
-            is_emoji: false,
+            is_emoji: true,
+            color: color.to_rgb().into()
         };
 
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if !raster_bounds.is_zero() {
+        let raster_bounds = self.text_system().raster_bounds(&params);
+        if !raster_bounds.as_ref().map(|rb| rb.is_zero()).unwrap_or(false) {
             let tile = self
                 .sprite_atlas
                 .get_or_insert_with(&params.clone().into(), &mut || {
@@ -2566,19 +2567,21 @@ impl Window {
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
+            let raster_bounds = raster_bounds.unwrap_or_else(|_| self.text_system().raster_bounds(&params).unwrap());
             let bounds = Bounds {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
             };
             let content_mask = self.content_mask().scale(scale_factor);
-            self.next_frame.scene.insert_primitive(MonochromeSprite {
+            self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
                 pad: 0,
+                grayscale: false,
                 bounds,
+                corner_radii: Default::default(),
                 content_mask,
-                color: color.opacity(element_opacity),
                 tile,
-                transformation: TransformationMatrix::unit(),
+                opacity: element_opacity,
             });
         }
         Ok(())
@@ -2611,6 +2614,7 @@ impl Window {
             subpixel_variant: Default::default(),
             scale_factor,
             is_emoji: true,
+            color: 0
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;

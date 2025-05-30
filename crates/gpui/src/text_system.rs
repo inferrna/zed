@@ -298,9 +298,8 @@ impl TextSystem {
         &self,
         params: &RenderGlyphParams,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        let raster_bounds = self.raster_bounds(params)?;
         self.platform_text_system
-            .rasterize_glyph(params, raster_bounds)
+            .rasterize_glyph(params)
     }
 }
 
@@ -692,6 +691,7 @@ pub(crate) struct RenderGlyphParams {
     pub(crate) subpixel_variant: Point<u8>,
     pub(crate) scale_factor: f32,
     pub(crate) is_emoji: bool,
+    pub(crate) color: u32,
 }
 
 impl Eq for RenderGlyphParams {}
@@ -704,6 +704,7 @@ impl Hash for RenderGlyphParams {
         self.subpixel_variant.hash(state);
         self.scale_factor.to_bits().hash(state);
         self.is_emoji.hash(state);
+        self.color.hash(state);
     }
 }
 
