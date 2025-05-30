@@ -2675,7 +2675,7 @@ impl Window {
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params);
-        if !raster_bounds.as_ref().map(|rb| rb.is_zero()).unwrap_or(false) {
+        if !raster_bounds.as_ref().map(|rb| rb.size.is_zero()).unwrap_or(false) {
             let tile = self
                 .sprite_atlas
                 .get_or_insert_with(&params.clone().into(), &mut || {
@@ -2733,8 +2733,8 @@ impl Window {
             color: 0
         };
 
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if !raster_bounds.is_zero() {
+        let raster_bounds = self.text_system().raster_bounds(&params);
+        if !raster_bounds.as_ref().map(|rb| rb.size.is_zero()).unwrap_or(false) {
             let tile = self
                 .sprite_atlas
                 .get_or_insert_with(&params.clone().into(), &mut || {
@@ -2742,7 +2742,7 @@ impl Window {
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
-
+            let raster_bounds = raster_bounds.unwrap_or_else(|_| self.text_system().raster_bounds(&params).unwrap());
             let bounds = Bounds {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
