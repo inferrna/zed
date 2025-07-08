@@ -20,14 +20,15 @@ use editor::{
 use futures::StreamExt as _;
 use git::blame::ParsedCommitMessage;
 use git::repository::{
-    Branch, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions, PushOptions,
-    Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus,
+    Branch, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions, GitCommitter,
+    PushOptions, Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking,
+    UpstreamTrackingStatus, get_git_committer,
 };
 use git::status::StageStatus;
 use git::{Amend, ToggleStaged, repository::RepoPath, status::FileStatus};
 use git::{ExpandCommitEditor, RestoreTrackedFiles, StageAll, TrashUntrackedFiles, UnstageAll};
 use gpui::{
-    Action, Animation, AnimationExt as _, AsyncWindowContext, Axis, ClickEvent, Corner,
+    Action, Animation, AnimationExt as _, AsyncApp, AsyncWindowContext, Axis, ClickEvent, Corner,
     DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, KeyContext,
     ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, Point, PromptLevel, ScrollStrategy, Subscription, Task,
@@ -55,6 +56,7 @@ use project::{
 use serde::{Deserialize, Serialize};
 use settings::{Settings as _, SettingsStore};
 use std::future::Future;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::{collections::HashSet, sync::Arc, time::Duration, usize};
 use strum::{IntoEnumIterator, VariantNames};
@@ -68,20 +70,25 @@ use util::{ResultExt, TryFutureExt, maybe};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
-    notifications::DetachAndPromptErr,
+    notifications::{DetachAndPromptErr, ErrorMessagePrompt, NotificationId},
 };
 use zed_llm_client::CompletionIntent;
 
 actions!(
     git_panel,
     [
+        /// Closes the git panel.
         Close,
+        /// Toggles focus on the git panel.
         ToggleFocus,
+        /// Opens the git panel menu.
         OpenMenu,
+        /// Focuses on the commit message editor.
         FocusEditor,
+        /// Focuses on the changes list.
         FocusChanges,
+        /// Toggles automatic co-author suggestions.
         ToggleFillCoAuthors,
-        GenerateCommitMessage
     ]
 );
 
@@ -121,40 +128,29 @@ fn git_panel_context_menu(
     ContextMenu::build(window, cx, move |context_menu, _, _| {
         context_menu
             .context(focus_handle)
-            .map(|menu| {
-                if state.has_unstaged_changes {
-                    menu.action("Stage All", StageAll.boxed_clone())
-                } else {
-                    menu.disabled_action("Stage All", StageAll.boxed_clone())
-                }
-            })
-            .map(|menu| {
-                if state.has_staged_changes {
-                    menu.action("Unstage All", UnstageAll.boxed_clone())
-                } else {
-                    menu.disabled_action("Unstage All", UnstageAll.boxed_clone())
-                }
-            })
+            .action_disabled_when(
+                !state.has_unstaged_changes,
+                "Stage All",
+                StageAll.boxed_clone(),
+            )
+            .action_disabled_when(
+                !state.has_staged_changes,
+                "Unstage All",
+                UnstageAll.boxed_clone(),
+            )
             .separator()
             .action("Open Diff", project_diff::Diff.boxed_clone())
             .separator()
-            .map(|menu| {
-                if state.has_tracked_changes {
-                    menu.action("Discard Tracked Changes", RestoreTrackedFiles.boxed_clone())
-                } else {
-                    menu.disabled_action(
-                        "Discard Tracked Changes",
-                        RestoreTrackedFiles.boxed_clone(),
-                    )
-                }
-            })
-            .map(|menu| {
-                if state.has_new_changes {
-                    menu.action("Trash Untracked Files", TrashUntrackedFiles.boxed_clone())
-                } else {
-                    menu.disabled_action("Trash Untracked Files", TrashUntrackedFiles.boxed_clone())
-                }
-            })
+            .action_disabled_when(
+                !state.has_tracked_changes,
+                "Discard Tracked Changes",
+                RestoreTrackedFiles.boxed_clone(),
+            )
+            .action_disabled_when(
+                !state.has_new_changes,
+                "Trash Untracked Files",
+                TrashUntrackedFiles.boxed_clone(),
+            )
     })
 }
 
@@ -357,6 +353,8 @@ pub struct GitPanel {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     modal_open: bool,
     show_placeholders: bool,
+    local_committer: Option<GitCommitter>,
+    local_committer_task: Option<Task<()>>,
     _settings_subscription: Subscription,
 }
 
@@ -373,7 +371,10 @@ pub(crate) fn commit_message_editor(
     let buffer = cx.new(|cx| MultiBuffer::singleton(commit_message_buffer, cx));
     let max_lines = if in_panel { MAX_PANEL_EDITOR_LINES } else { 18 };
     let mut commit_editor = Editor::new(
-        EditorMode::AutoHeight { max_lines },
+        EditorMode::AutoHeight {
+            min_lines: 1,
+            max_lines: Some(max_lines),
+        },
         buffer,
         None,
         window,
@@ -382,6 +383,7 @@ pub(crate) fn commit_message_editor(
     commit_editor.set_collaboration_hub(Box::new(project));
     commit_editor.set_use_autoclose(false);
     commit_editor.set_show_gutter(false, cx);
+    commit_editor.set_use_modal_editing(true);
     commit_editor.set_show_wrap_guides(false, cx);
     commit_editor.set_show_indent_guides(false, cx);
     let placeholder = placeholder.unwrap_or("Enter commit message".into());
@@ -468,7 +470,7 @@ impl GitPanel {
                     }
                     GitStoreEvent::RepositoryUpdated(
                         _,
-                        RepositoryEvent::Updated { full_scan },
+                        RepositoryEvent::Updated { full_scan, .. },
                         true,
                     ) => {
                         this.schedule_update(*full_scan, window, cx);
@@ -519,6 +521,8 @@ impl GitPanel {
                 update_visible_entries_task: Task::ready(()),
                 width: None,
                 show_placeholders: false,
+                local_committer: None,
+                local_committer_task: None,
                 context_menu: None,
                 workspace: workspace.weak_handle(),
                 modal_open: false,
@@ -1779,7 +1783,19 @@ impl GitPanel {
                     this.generate_commit_message_task.take();
                 });
 
-                let mut diff_text = diff.await??;
+                let mut diff_text = match diff.await {
+                    Ok(result) => match result {
+                        Ok(text) => text,
+                        Err(e) => {
+                            Self::show_commit_message_error(&this, &e, cx);
+                            return anyhow::Ok(());
+                        }
+                    },
+                    Err(e) => {
+                        Self::show_commit_message_error(&this, &e, cx);
+                        return anyhow::Ok(());
+                    }
+                };
 
                 const ONE_MB: usize = 1_000_000;
                 if diff_text.len() > ONE_MB {
@@ -1817,26 +1833,37 @@ impl GitPanel {
                 };
 
                 let stream = model.stream_completion_text(request, &cx);
-                let mut messages = stream.await?;
+                match stream.await {
+                    Ok(mut messages) => {
+                        if !text_empty {
+                            this.update(cx, |this, cx| {
+                                this.commit_message_buffer(cx).update(cx, |buffer, cx| {
+                                    let insert_position = buffer.anchor_before(buffer.len());
+                                    buffer.edit([(insert_position..insert_position, "\n")], None, cx)
+                                });
+                            })?;
+                        }
 
-                if !text_empty {
-                    this.update(cx, |this, cx| {
-                        this.commit_message_buffer(cx).update(cx, |buffer, cx| {
-                            let insert_position = buffer.anchor_before(buffer.len());
-                            buffer.edit([(insert_position..insert_position, "\n")], None, cx)
-                        });
-                    })?;
-                }
-
-                while let Some(message) = messages.stream.next().await {
-                    let text = message?;
-
-                    this.update(cx, |this, cx| {
-                        this.commit_message_buffer(cx).update(cx, |buffer, cx| {
-                            let insert_position = buffer.anchor_before(buffer.len());
-                            buffer.edit([(insert_position..insert_position, text)], None, cx);
-                        });
-                    })?;
+                        while let Some(message) = messages.stream.next().await {
+                            match message {
+                                Ok(text) => {
+                                    this.update(cx, |this, cx| {
+                                        this.commit_message_buffer(cx).update(cx, |buffer, cx| {
+                                            let insert_position = buffer.anchor_before(buffer.len());
+                                            buffer.edit([(insert_position..insert_position, text)], None, cx);
+                                        });
+                                    })?;
+                                }
+                                Err(e) => {
+                                    Self::show_commit_message_error(&this, &e, cx);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        Self::show_commit_message_error(&this, &e, cx);
+                    }
                 }
 
                 anyhow::Ok(())
@@ -2226,6 +2253,19 @@ impl GitPanel {
         }
     }
 
+    pub fn load_local_committer(&mut self, cx: &Context<Self>) {
+        if self.local_committer_task.is_none() {
+            self.local_committer_task = Some(cx.spawn(async move |this, cx| {
+                let committer = get_git_committer(cx).await;
+                this.update(cx, |this, cx| {
+                    this.local_committer = Some(committer);
+                    cx.notify()
+                })
+                .ok();
+            }));
+        }
+    }
+
     fn potential_co_authors(&self, cx: &App) -> Vec<(String, String)> {
         let mut new_co_authors = Vec::new();
         let project = self.project.read(cx);
@@ -2248,32 +2288,36 @@ impl GitPanel {
             let Some(participant) = room.remote_participant_for_peer_id(*peer_id) else {
                 continue;
             };
-            if participant.can_write() && participant.user.email.is_some() {
-                let email = participant.user.email.clone().unwrap();
-
-                new_co_authors.push((
-                    participant
-                        .user
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| participant.user.github_login.clone()),
-                    email,
-                ))
+            if !participant.can_write() {
+                continue;
+            }
+            if let Some(email) = &collaborator.committer_email {
+                let name = collaborator
+                    .committer_name
+                    .clone()
+                    .or_else(|| participant.user.name.clone())
+                    .unwrap_or_else(|| participant.user.github_login.clone());
+                new_co_authors.push((name.clone(), email.clone()))
             }
         }
         if !project.is_local() && !project.is_read_only(cx) {
-            if let Some(user) = room.local_participant_user(cx) {
-                if let Some(email) = user.email.clone() {
-                    new_co_authors.push((
-                        user.name
-                            .clone()
-                            .unwrap_or_else(|| user.github_login.clone()),
-                        email.clone(),
-                    ))
-                }
+            if let Some(local_committer) = self.local_committer(room, cx) {
+                new_co_authors.push(local_committer);
             }
         }
         new_co_authors
+    }
+
+    fn local_committer(&self, room: &call::Room, cx: &App) -> Option<(String, String)> {
+        let user = room.local_participant_user(cx)?;
+        let committer = self.local_committer.as_ref()?;
+        let email = committer.email.clone()?;
+        let name = committer
+            .name
+            .clone()
+            .or_else(|| user.name.clone())
+            .unwrap_or_else(|| user.github_login.clone());
+        Some((name, email))
     }
 
     fn toggle_fill_co_authors(
@@ -2690,6 +2734,26 @@ impl GitPanel {
                         })
                 });
                 workspace.toggle_status_toast(toast, cx)
+            });
+        }
+    }
+
+    fn show_commit_message_error<E>(weak_this: &WeakEntity<Self>, err: &E, cx: &mut AsyncApp)
+    where
+        E: std::fmt::Debug + std::fmt::Display,
+    {
+        if let Ok(Some(workspace)) = weak_this.update(cx, |this, _cx| this.workspace.upgrade()) {
+            let _ = workspace.update(cx, |workspace, cx| {
+                struct CommitMessageError;
+                let notification_id = NotificationId::unique::<CommitMessageError>();
+                workspace.show_notification(notification_id, cx, |cx| {
+                    cx.new(|cx| {
+                        ErrorMessagePrompt::new(
+                            format!("Failed to generate commit message: {err}"),
+                            cx,
+                        )
+                    })
+                });
             });
         }
     }
@@ -3667,8 +3731,10 @@ impl GitPanel {
                     .relative()
                     .overflow_hidden()
                     .child(
-                        uniform_list(cx.entity().clone(), "entries", entry_count, {
-                            move |this, range, window, cx| {
+                        uniform_list(
+                            "entries",
+                            entry_count,
+                            cx.processor(move |this, range: Range<usize>, window, cx| {
                                 let mut items = Vec::with_capacity(range.end - range.start);
 
                                 for ix in range {
@@ -3696,8 +3762,8 @@ impl GitPanel {
                                 }
 
                                 items
-                            }
-                        })
+                            }),
+                        )
                         .when(
                             !self.horizontal_scrollbar.show_track
                                 && self.horizontal_scrollbar.show_scrollbar,
@@ -4198,8 +4264,9 @@ impl Render for GitPanel {
         let has_write_access = self.has_write_access(cx);
 
         let has_co_authors = room.map_or(false, |room| {
-            room.read(cx)
-                .remote_participants()
+            self.load_local_committer(cx);
+            let room = room.read(cx);
+            room.remote_participants()
                 .values()
                 .any(|remote_participant| remote_participant.can_write())
         });

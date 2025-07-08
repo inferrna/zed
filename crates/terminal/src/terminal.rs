@@ -47,6 +47,7 @@ use task::{HideStrategy, Shell, TaskId};
 use terminal_hyperlinks::RegexSearches;
 use terminal_settings::{AlternateScroll, CursorShape, TerminalSettings};
 use theme::{ActiveTheme, Theme};
+use urlencoding;
 use util::{paths::home_dir, truncate_and_trailoff};
 
 use std::{
@@ -72,18 +73,36 @@ use crate::mappings::{colors::to_alac_rgb, keys::to_esc_str};
 actions!(
     terminal,
     [
+        /// Clears the terminal screen.
         Clear,
+        /// Copies selected text to the clipboard.
         Copy,
+        /// Pastes from the clipboard.
         Paste,
+        /// Shows the character palette for special characters.
         ShowCharacterPalette,
+        /// Searches for text in the terminal.
         SearchTest,
+        /// Scrolls up by one line.
         ScrollLineUp,
+        /// Scrolls down by one line.
         ScrollLineDown,
+        /// Scrolls up by one page.
         ScrollPageUp,
+        /// Scrolls down by one page.
         ScrollPageDown,
+        /// Scrolls up by half a page.
+        ScrollHalfPageUp,
+        /// Scrolls down by half a page.
+        ScrollHalfPageDown,
+        /// Scrolls to the top of the terminal buffer.
         ScrollToTop,
+        /// Scrolls to the bottom of the terminal buffer.
         ScrollToBottom,
+        /// Toggles vi mode in the terminal.
         ToggleViMode,
+        /// Selects all text in the terminal.
+        SelectAll,
     ]
 );
 
@@ -879,7 +898,13 @@ impl Terminal {
 
             InternalEvent::Copy => {
                 if let Some(txt) = term.selection_to_string() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(txt))
+                    cx.write_to_clipboard(ClipboardItem::new_string(txt));
+
+                    let settings = TerminalSettings::get_global(cx);
+
+                    if !settings.keep_selection_on_copy {
+                        self.events.push_back(InternalEvent::SetSelection(None));
+                    }
                 }
             }
             InternalEvent::ScrollToAlacPoint(point) => {
@@ -910,7 +935,22 @@ impl Terminal {
                 ) {
                     Some((maybe_url_or_path, is_url, url_match)) => {
                         let target = if is_url {
-                            MaybeNavigationTarget::Url(maybe_url_or_path.clone())
+                            // Treat "file://" URLs like file paths to ensure
+                            // that line numbers at the end of the path are
+                            // handled correctly.
+                            // file://{path} should be urldecoded, returning a urldecoded {path}
+                            if let Some(path) = maybe_url_or_path.strip_prefix("file://") {
+                                let decoded_path = urlencoding::decode(path)
+                                    .map(|decoded| decoded.into_owned())
+                                    .unwrap_or(path.to_owned());
+
+                                MaybeNavigationTarget::PathLike(PathLikeTarget {
+                                    maybe_path: decoded_path,
+                                    terminal_dir: self.working_directory(),
+                                })
+                            } else {
+                                MaybeNavigationTarget::Url(maybe_url_or_path.clone())
+                            }
                         } else {
                             MaybeNavigationTarget::PathLike(PathLikeTarget {
                                 maybe_path: maybe_url_or_path.clone(),

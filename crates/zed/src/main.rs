@@ -29,7 +29,7 @@ use project::project_settings::ProjectSettings;
 use recent_projects::{SshSettings, open_ssh_project};
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use session::{AppSession, Session};
-use settings::{Settings, SettingsStore, watch_config_file};
+use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
 use std::{
     env,
     io::{self, IsTerminal},
@@ -43,13 +43,16 @@ use theme::{
 };
 use util::{ConnectionResult, ResultExt, TryFutureExt, maybe};
 use uuid::Uuid;
-use welcome::{BaseKeymap, FIRST_OPEN, show_welcome_view};
-use workspace::{AppState, SerializedWorkspaceLocation, WorkspaceSettings, WorkspaceStore};
+use welcome::{FIRST_OPEN, show_welcome_view};
+use workspace::{
+    AppState, SerializedWorkspaceLocation, Toast, Workspace, WorkspaceSettings, WorkspaceStore,
+    notifications::NotificationId,
+};
 use zed::{
-    OpenListener, OpenRequest, app_menus, build_window_options, derive_paths_with_position,
-    handle_cli_connection, handle_keymap_file_changes, handle_settings_changed,
-    handle_settings_file_changes, initialize_workspace, inline_completion_registry,
-    open_paths_with_positions,
+    OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
+    derive_paths_with_position, handle_cli_connection, handle_keymap_file_changes,
+    handle_settings_changed, handle_settings_file_changes, initialize_workspace,
+    inline_completion_registry, open_paths_with_positions,
 };
 
 #[cfg(feature = "mimalloc")]
@@ -162,22 +165,7 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
 
 pub fn main() {
     #[cfg(unix)]
-    {
-        let is_root = nix::unistd::geteuid().is_root();
-        let allow_root = env::var("ZED_ALLOW_ROOT").is_ok_and(|val| val == "true");
-
-        // Prevent running Zed with root privileges on Unix systems unless explicitly allowed
-        if is_root && !allow_root {
-            eprintln!(
-                "\
-Error: Running Zed as root or via sudo is unsupported.
-       Doing so (even once) may subtly break things for all subsequent non-root usage of Zed.
-       It is untested and not recommended, don't complain when things break.
-       If you wish to proceed anyways, set `ZED_ALLOW_ROOT=true` in your environment."
-            );
-            process::exit(1);
-        }
-    }
+    util::prevent_root_execution();
 
     // Check if there is a pending installer
     // If there is, run the installer and exit
@@ -191,8 +179,15 @@ Error: Running Zed as root or via sudo is unsupported.
 
     let args = Args::parse();
 
+    // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     if let Some(socket) = &args.askpass {
         askpass::main(socket);
+        return;
+    }
+
+    // `zed --printenv` Outputs environment variables as JSON to stdout
+    if args.printenv {
+        util::shell_env::print_env();
         return;
     }
 
@@ -337,7 +332,12 @@ Error: Running Zed as root or via sudo is unsupported.
 
     app.on_open_urls({
         let open_listener = open_listener.clone();
-        move |urls| open_listener.open_urls(urls)
+        move |urls| {
+            open_listener.open(RawOpenRequest {
+                urls,
+                diff_paths: Vec::new(),
+            })
+        }
     });
     app.on_reopen(move |cx| {
         if let Some(app_state) = AppState::try_global(cx).and_then(|app_state| app_state.upgrade())
@@ -519,12 +519,7 @@ Error: Running Zed as root or via sudo is unsupported.
         );
         supermaven::init(app_state.client.clone(), cx);
         language_model::init(app_state.client.clone(), cx);
-        language_models::init(
-            app_state.user_store.clone(),
-            app_state.client.clone(),
-            app_state.fs.clone(),
-            cx,
-        );
+        language_models::init(app_state.user_store.clone(), app_state.client.clone(), cx);
         web_search::init(cx);
         web_search_providers::init(app_state.client.clone(), cx);
         snippet_provider::init(cx);
@@ -534,7 +529,7 @@ Error: Running Zed as root or via sudo is unsupported.
             cx,
         );
         let prompt_builder = PromptBuilder::load(app_state.fs.clone(), stdout_is_a_pty(), cx);
-        agent::init(
+        agent_ui::init(
             app_state.fs.clone(),
             app_state.client.clone(),
             prompt_builder.clone(),
@@ -590,6 +585,7 @@ Error: Running Zed as root or via sudo is unsupported.
         jj_ui::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);
+        svg_preview::init(cx);
         welcome::init(cx);
         settings_ui::init(cx);
         extensions_ui::init(cx);
@@ -666,15 +662,21 @@ Error: Running Zed as root or via sudo is unsupported.
             .filter_map(|arg| parse_url_arg(arg, cx).log_err())
             .collect();
 
-        if !urls.is_empty() {
-            open_listener.open_urls(urls)
+        let diff_paths: Vec<[String; 2]> = args
+            .diff
+            .chunks(2)
+            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
+            .collect();
+
+        if !urls.is_empty() || !diff_paths.is_empty() {
+            open_listener.open(RawOpenRequest { urls, diff_paths })
         }
 
         match open_rx
             .try_next()
             .ok()
             .flatten()
-            .and_then(|urls| OpenRequest::parse(urls, cx).log_err())
+            .and_then(|request| OpenRequest::parse(request, cx).log_err())
         {
             Some(request) => {
                 handle_open_request(request, app_state.clone(), cx);
@@ -725,11 +727,10 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
 
     if let Some(connection_options) = request.ssh_connection {
         cx.spawn(async move |mut cx| {
-            let paths_with_position =
-                derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
+            let paths: Vec<PathBuf> = request.open_paths.into_iter().map(PathBuf::from).collect();
             open_ssh_project(
                 connection_options,
-                paths_with_position.into_iter().map(|p| p.path).collect(),
+                paths,
                 app_state,
                 workspace::OpenOptions::default(),
                 &mut cx,
@@ -741,13 +742,14 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
     }
 
     let mut task = None;
-    if !request.open_paths.is_empty() {
+    if !request.open_paths.is_empty() || !request.diff_paths.is_empty() {
         let app_state = app_state.clone();
         task = Some(cx.spawn(async move |mut cx| {
             let paths_with_position =
                 derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
             let (_window, results) = open_paths_with_positions(
                 &paths_with_position,
+                &request.diff_paths,
                 app_state,
                 workspace::OpenOptions::default(),
                 &mut cx,
@@ -887,38 +889,105 @@ async fn installation_id() -> Result<IdType> {
 
 async fn restore_or_create_workspace(app_state: Arc<AppState>, cx: &mut AsyncApp) -> Result<()> {
     if let Some(locations) = restorable_workspace_locations(cx, &app_state).await {
+        let mut tasks = Vec::new();
+
         for location in locations {
             match location {
                 SerializedWorkspaceLocation::Local(location, _) => {
-                    let task = cx.update(|cx| {
-                        workspace::open_paths(
-                            location.paths().as_ref(),
-                            app_state.clone(),
-                            workspace::OpenOptions::default(),
-                            cx,
-                        )
-                    })?;
-                    task.await?;
+                    let app_state = app_state.clone();
+                    let paths = location.paths().to_vec();
+                    let task = cx.spawn(async move |cx| {
+                        let open_task = cx.update(|cx| {
+                            workspace::open_paths(
+                                &paths,
+                                app_state,
+                                workspace::OpenOptions::default(),
+                                cx,
+                            )
+                        })?;
+                        open_task.await.map(|_| ())
+                    });
+                    tasks.push(task);
                 }
                 SerializedWorkspaceLocation::Ssh(ssh) => {
-                    let connection_options = cx.update(|cx| {
-                        SshSettings::get_global(cx)
-                            .connection_options_for(ssh.host, ssh.port, ssh.user)
-                    })?;
                     let app_state = app_state.clone();
-                    cx.spawn(async move |cx| {
-                        recent_projects::open_ssh_project(
-                            connection_options,
-                            ssh.paths.into_iter().map(PathBuf::from).collect(),
-                            app_state,
-                            workspace::OpenOptions::default(),
-                            cx,
-                        )
-                        .await
-                        .log_err();
-                    })
-                    .detach();
+                    let ssh_host = ssh.host.clone();
+                    let task = cx.spawn(async move |cx| {
+                        let connection_options = cx.update(|cx| {
+                            SshSettings::get_global(cx)
+                                .connection_options_for(ssh.host, ssh.port, ssh.user)
+                        });
+
+                        match connection_options {
+                            Ok(connection_options) => recent_projects::open_ssh_project(
+                                connection_options,
+                                ssh.paths.into_iter().map(PathBuf::from).collect(),
+                                app_state,
+                                workspace::OpenOptions::default(),
+                                cx,
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e)),
+                            Err(e) => Err(anyhow::anyhow!(
+                                "Failed to get SSH connection options for {}: {}",
+                                ssh_host,
+                                e
+                            )),
+                        }
+                    });
+                    tasks.push(task);
                 }
+            }
+        }
+
+        // Wait for all workspaces to open concurrently
+        let results = future::join_all(tasks).await;
+
+        // Show notifications for any errors that occurred
+        let mut error_count = 0;
+        for result in results {
+            if let Err(e) = result {
+                log::error!("Failed to restore workspace: {}", e);
+                error_count += 1;
+            }
+        }
+
+        if error_count > 0 {
+            let message = if error_count == 1 {
+                "Failed to restore 1 workspace. Check logs for details.".to_string()
+            } else {
+                format!(
+                    "Failed to restore {} workspaces. Check logs for details.",
+                    error_count
+                )
+            };
+
+            // Try to find an active workspace to show the toast
+            let toast_shown = cx
+                .update(|cx| {
+                    if let Some(window) = cx.active_window() {
+                        if let Some(workspace) = window.downcast::<Workspace>() {
+                            workspace
+                                .update(cx, |workspace, _, cx| {
+                                    workspace.show_toast(
+                                        Toast::new(NotificationId::unique::<()>(), message),
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                            return true;
+                        }
+                    }
+                    false
+                })
+                .unwrap_or(false);
+
+            // If we couldn't show a toast (no windows opened successfully),
+            // we've already logged the errors above, so the user can check logs
+            if !toast_shown {
+                log::error!(
+                    "Failed to show notification for window restoration errors, because no workspace windows were available."
+                );
             }
         }
     } else if matches!(KEY_VALUE_STORE.read_kvp(FIRST_OPEN), Ok(None)) {
@@ -1035,6 +1104,10 @@ struct Args {
     /// URLs can either be `file://` or `zed://` scheme, or relative to <https://zed.dev>.
     paths_or_urls: Vec<String>,
 
+    /// Pairs of file paths to diff. Can be specified multiple times.
+    #[arg(long, action = clap::ArgAction::Append, num_args = 2, value_names = ["OLD_PATH", "NEW_PATH"])]
+    diff: Vec<String>,
+
     /// Sets a custom directory for all user data (e.g., database, extensions, logs).
     /// This overrides the default platform-specific data directory location.
     /// On macOS, the default is `~/Library/Application Support/Zed`.
@@ -1071,6 +1144,10 @@ struct Args {
 
     #[arg(long, hide = true)]
     dump_all_actions: bool,
+
+    /// Output current environment variables as JSON to stdout
+    #[arg(long, hide = true)]
+    printenv: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1290,13 +1367,15 @@ fn dump_all_gpui_actions() {
         name: &'static str,
         human_name: String,
         aliases: &'static [&'static str],
+        documentation: Option<&'static str>,
     }
     let mut actions = gpui::generate_list_of_all_registered_actions()
         .into_iter()
         .map(|action| ActionDef {
             name: action.name,
             human_name: command_palette::humanize_action_name(action.name),
-            aliases: action.aliases,
+            aliases: action.deprecated_aliases,
+            documentation: action.documentation,
         })
         .collect::<Vec<ActionDef>>();
 

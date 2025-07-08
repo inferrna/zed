@@ -1,22 +1,25 @@
-use std::cell::{Ref, RefCell};
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-
+use crate::{
+    context_server_tool::ContextServerTool,
+    thread::{
+        DetailedSummaryState, ExceededWindowError, MessageId, ProjectSnapshot, Thread, ThreadId,
+    },
+};
 use agent_settings::{AgentProfileId, CompletionMode};
 use anyhow::{Context as _, Result, anyhow};
-use assistant_tool::{ToolId, ToolWorkingSet};
+use assistant_tool::{Tool, ToolId, ToolWorkingSet};
 use chrono::{DateTime, Utc};
 use collections::HashMap;
 use context_server::ContextServerId;
-use futures::channel::{mpsc, oneshot};
-use futures::future::{self, BoxFuture, Shared};
-use futures::{FutureExt as _, StreamExt as _};
+use futures::{
+    FutureExt as _, StreamExt as _,
+    channel::{mpsc, oneshot},
+    future::{self, BoxFuture, Shared},
+};
 use gpui::{
     App, BackgroundExecutor, Context, Entity, EventEmitter, Global, ReadGlobal, SharedString,
-    Subscription, Task, prelude::*,
+    Subscription, Task, Window, prelude::*,
 };
-
+use indoc::indoc;
 use language_model::{LanguageModelToolResultContent, LanguageModelToolUseId, Role, TokenUsage};
 use project::context_server_store::{ContextServerStatus, ContextServerStore};
 use project::{Project, ProjectItem, ProjectPath, Worktree};
@@ -25,19 +28,18 @@ use prompt_store::{
     UserRulesContext, WorktreeContext,
 };
 use serde::{Deserialize, Serialize};
-use ui::Window;
-use util::ResultExt as _;
-
-use crate::context_server_tool::ContextServerTool;
-use crate::thread::{
-    DetailedSummaryState, ExceededWindowError, MessageId, ProjectSnapshot, Thread, ThreadId,
-};
-use indoc::indoc;
 use sqlez::{
     bindable::{Bind, Column},
     connection::Connection,
     statement::Statement,
 };
+use std::{
+    cell::{Ref, RefCell},
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
+use util::ResultExt as _;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
@@ -69,7 +71,7 @@ impl Column for DataType {
     }
 }
 
-const RULES_FILE_NAMES: [&'static str; 8] = [
+const RULES_FILE_NAMES: [&'static str; 9] = [
     ".rules",
     ".cursorrules",
     ".windsurfrules",
@@ -78,6 +80,7 @@ const RULES_FILE_NAMES: [&'static str; 8] = [
     "CLAUDE.md",
     "AGENT.md",
     "AGENTS.md",
+    "GEMINI.md",
 ];
 
 pub fn init(cx: &mut App) {
@@ -94,7 +97,7 @@ impl SharedProjectContext {
     }
 }
 
-pub type TextThreadStore = assistant_context_editor::ContextStore;
+pub type TextThreadStore = assistant_context::ContextStore;
 
 pub struct ThreadStore {
     project: Entity<Project>,
@@ -305,17 +308,19 @@ impl ThreadStore {
         project: Entity<Project>,
         cx: &mut App,
     ) -> Task<(WorktreeContext, Option<RulesLoadingError>)> {
-        let root_name = worktree.read(cx).root_name().into();
+        let tree = worktree.read(cx);
+        let root_name = tree.root_name().into();
+        let abs_path = tree.abs_path();
+
+        let mut context = WorktreeContext {
+            root_name,
+            abs_path,
+            rules_file: None,
+        };
 
         let rules_task = Self::load_worktree_rules_file(worktree, project, cx);
         let Some(rules_task) = rules_task else {
-            return Task::ready((
-                WorktreeContext {
-                    root_name,
-                    rules_file: None,
-                },
-                None,
-            ));
+            return Task::ready((context, None));
         };
 
         cx.spawn(async move |_| {
@@ -328,11 +333,8 @@ impl ThreadStore {
                     }),
                 ),
             };
-            let worktree_info = WorktreeContext {
-                root_name,
-                rules_file,
-            };
-            (worktree_info, rules_file_error)
+            context.rules_file = rules_file;
+            (context, rules_file_error)
         })
     }
 
@@ -341,12 +343,12 @@ impl ThreadStore {
         project: Entity<Project>,
         cx: &mut App,
     ) -> Option<Task<Result<RulesFileContext>>> {
-        let worktree_ref = worktree.read(cx);
-        let worktree_id = worktree_ref.id();
+        let worktree = worktree.read(cx);
+        let worktree_id = worktree.id();
         let selected_rules_file = RULES_FILE_NAMES
             .into_iter()
             .filter_map(|name| {
-                worktree_ref
+                worktree
                     .entry_for_path(name)
                     .filter(|entry| entry.is_file())
                     .map(|entry| entry.path.clone())
@@ -535,8 +537,8 @@ impl ThreadStore {
                     }
                     ContextServerStatus::Stopped | ContextServerStatus::Error(_) => {
                         if let Some(tool_ids) = self.context_server_tool_ids.remove(server_id) {
-                            tool_working_set.update(cx, |tool_working_set, _| {
-                                tool_working_set.remove(&tool_ids);
+                            tool_working_set.update(cx, |tool_working_set, cx| {
+                                tool_working_set.remove(&tool_ids, cx);
                             });
                         }
                     }
@@ -562,24 +564,22 @@ impl ThreadStore {
 
             if protocol.capable(context_server::protocol::ServerCapability::Tools) {
                 if let Some(response) = protocol
-                    .request::<context_server::types::request::ListTools>(())
+                    .request::<context_server::types::requests::ListTools>(())
                     .await
                     .log_err()
                 {
                     let tool_ids = tool_working_set
-                        .update(cx, |tool_working_set, _| {
-                            response
-                                .tools
-                                .into_iter()
-                                .map(|tool| {
-                                    log::info!("registering context server tool: {:?}", tool.name);
-                                    tool_working_set.insert(Arc::new(ContextServerTool::new(
+                        .update(cx, |tool_working_set, cx| {
+                            tool_working_set.extend(
+                                response.tools.into_iter().map(|tool| {
+                                    Arc::new(ContextServerTool::new(
                                         context_server_store.clone(),
                                         server.id(),
                                         tool,
-                                    )))
-                                })
-                                .collect::<Vec<_>>()
+                                    )) as Arc<dyn Tool>
+                                }),
+                                cx,
+                            )
                         })
                         .log_err();
 
@@ -603,7 +603,7 @@ pub struct SerializedThreadMetadata {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct SerializedThread {
     pub version: String,
     pub summary: SharedString,
@@ -629,7 +629,7 @@ pub struct SerializedThread {
     pub profile: Option<AgentProfileId>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct SerializedLanguageModel {
     pub provider: String,
     pub model: String,
@@ -690,11 +690,15 @@ impl SerializedThreadV0_1_0 {
             messages.push(message);
         }
 
-        SerializedThread { messages, ..self.0 }
+        SerializedThread {
+            messages,
+            version: SerializedThread::VERSION.to_string(),
+            ..self.0
+        }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct SerializedMessage {
     pub id: MessageId,
     pub role: Role,
@@ -712,7 +716,7 @@ pub struct SerializedMessage {
     pub is_hidden: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum SerializedMessageSegment {
     #[serde(rename = "text")]
@@ -726,18 +730,18 @@ pub enum SerializedMessageSegment {
         signature: Option<String>,
     },
     RedactedThinking {
-        data: Vec<u8>,
+        data: String,
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct SerializedToolUse {
     pub id: LanguageModelToolUseId,
     pub name: SharedString,
     pub input: serde_json::Value,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct SerializedToolResult {
     pub tool_use_id: LanguageModelToolUseId,
     pub is_error: bool,
@@ -800,7 +804,7 @@ impl LegacySerializedMessage {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct SerializedCrease {
     pub start: usize,
     pub end: usize,
@@ -1055,5 +1059,183 @@ impl ThreadsDatabase {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thread::{DetailedSummaryState, MessageId};
+    use chrono::Utc;
+    use language_model::{Role, TokenUsage};
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_legacy_serialized_thread_upgrade() {
+        let updated_at = Utc::now();
+        let legacy_thread = LegacySerializedThread {
+            summary: "Test conversation".into(),
+            updated_at,
+            messages: vec![LegacySerializedMessage {
+                id: MessageId(1),
+                role: Role::User,
+                text: "Hello, world!".to_string(),
+                tool_uses: vec![],
+                tool_results: vec![],
+            }],
+            initial_project_snapshot: None,
+        };
+
+        let upgraded = legacy_thread.upgrade();
+
+        assert_eq!(
+            upgraded,
+            SerializedThread {
+                summary: "Test conversation".into(),
+                updated_at,
+                messages: vec![SerializedMessage {
+                    id: MessageId(1),
+                    role: Role::User,
+                    segments: vec![SerializedMessageSegment::Text {
+                        text: "Hello, world!".to_string()
+                    }],
+                    tool_uses: vec![],
+                    tool_results: vec![],
+                    context: "".to_string(),
+                    creases: vec![],
+                    is_hidden: false
+                }],
+                version: SerializedThread::VERSION.to_string(),
+                initial_project_snapshot: None,
+                cumulative_token_usage: TokenUsage::default(),
+                request_token_usage: vec![],
+                detailed_summary_state: DetailedSummaryState::default(),
+                exceeded_window_error: None,
+                model: None,
+                completion_mode: None,
+                tool_use_limit_reached: false,
+                profile: None
+            }
+        )
+    }
+
+    #[test]
+    fn test_serialized_threadv0_1_0_upgrade() {
+        let updated_at = Utc::now();
+        let thread_v0_1_0 = SerializedThreadV0_1_0(SerializedThread {
+            summary: "Test conversation".into(),
+            updated_at,
+            messages: vec![
+                SerializedMessage {
+                    id: MessageId(1),
+                    role: Role::User,
+                    segments: vec![SerializedMessageSegment::Text {
+                        text: "Use tool_1".to_string(),
+                    }],
+                    tool_uses: vec![],
+                    tool_results: vec![],
+                    context: "".to_string(),
+                    creases: vec![],
+                    is_hidden: false,
+                },
+                SerializedMessage {
+                    id: MessageId(2),
+                    role: Role::Assistant,
+                    segments: vec![SerializedMessageSegment::Text {
+                        text: "I want to use a tool".to_string(),
+                    }],
+                    tool_uses: vec![SerializedToolUse {
+                        id: "abc".into(),
+                        name: "tool_1".into(),
+                        input: serde_json::Value::Null,
+                    }],
+                    tool_results: vec![],
+                    context: "".to_string(),
+                    creases: vec![],
+                    is_hidden: false,
+                },
+                SerializedMessage {
+                    id: MessageId(1),
+                    role: Role::User,
+                    segments: vec![SerializedMessageSegment::Text {
+                        text: "Here is the tool result".to_string(),
+                    }],
+                    tool_uses: vec![],
+                    tool_results: vec![SerializedToolResult {
+                        tool_use_id: "abc".into(),
+                        is_error: false,
+                        content: LanguageModelToolResultContent::Text("abcdef".into()),
+                        output: Some(serde_json::Value::Null),
+                    }],
+                    context: "".to_string(),
+                    creases: vec![],
+                    is_hidden: false,
+                },
+            ],
+            version: SerializedThreadV0_1_0::VERSION.to_string(),
+            initial_project_snapshot: None,
+            cumulative_token_usage: TokenUsage::default(),
+            request_token_usage: vec![],
+            detailed_summary_state: DetailedSummaryState::default(),
+            exceeded_window_error: None,
+            model: None,
+            completion_mode: None,
+            tool_use_limit_reached: false,
+            profile: None,
+        });
+        let upgraded = thread_v0_1_0.upgrade();
+
+        assert_eq!(
+            upgraded,
+            SerializedThread {
+                summary: "Test conversation".into(),
+                updated_at,
+                messages: vec![
+                    SerializedMessage {
+                        id: MessageId(1),
+                        role: Role::User,
+                        segments: vec![SerializedMessageSegment::Text {
+                            text: "Use tool_1".to_string()
+                        }],
+                        tool_uses: vec![],
+                        tool_results: vec![],
+                        context: "".to_string(),
+                        creases: vec![],
+                        is_hidden: false
+                    },
+                    SerializedMessage {
+                        id: MessageId(2),
+                        role: Role::Assistant,
+                        segments: vec![SerializedMessageSegment::Text {
+                            text: "I want to use a tool".to_string(),
+                        }],
+                        tool_uses: vec![SerializedToolUse {
+                            id: "abc".into(),
+                            name: "tool_1".into(),
+                            input: serde_json::Value::Null,
+                        }],
+                        tool_results: vec![SerializedToolResult {
+                            tool_use_id: "abc".into(),
+                            is_error: false,
+                            content: LanguageModelToolResultContent::Text("abcdef".into()),
+                            output: Some(serde_json::Value::Null),
+                        }],
+                        context: "".to_string(),
+                        creases: vec![],
+                        is_hidden: false,
+                    },
+                ],
+                version: SerializedThread::VERSION.to_string(),
+                initial_project_snapshot: None,
+                cumulative_token_usage: TokenUsage::default(),
+                request_token_usage: vec![],
+                detailed_summary_state: DetailedSummaryState::default(),
+                exceeded_window_error: None,
+                model: None,
+                completion_mode: None,
+                tool_use_limit_reached: false,
+                profile: None
+            }
+        )
     }
 }

@@ -1,8 +1,9 @@
+use crate::color_contrast;
 use editor::{CursorLayout, HighlightedRange, HighlightedRangeLine};
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, DispatchPhase, Element,
     ElementId, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, HighlightStyle,
-    Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity, IntoElement, LayoutId,
+    Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity, IntoElement, LayoutId, Length,
     ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels, Point, ShapedLine,
     StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle, UTF16Selection,
     UnderlineStyle, WeakEntity, WhiteSpace, Window, WindowTextSystem, div, fill, point, px,
@@ -32,7 +33,7 @@ use workspace::Workspace;
 use std::mem;
 use std::{fmt::Debug, ops::RangeInclusive, rc::Rc};
 
-use crate::{BlockContext, BlockProperties, TerminalMode, TerminalView};
+use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
 
 /// The information generated during layout that is necessary for painting.
 pub struct LayoutState {
@@ -49,6 +50,7 @@ pub struct LayoutState {
     gutter: Pixels,
     block_below_cursor_element: Option<AnyElement>,
     base_text_style: TextStyle,
+    content_mode: ContentMode,
 }
 
 /// Helper struct for converting data between Alacritty's cursor points, and displayed cursor points.
@@ -195,17 +197,17 @@ impl TerminalElement {
             interactivity: Default::default(),
         }
         .track_focus(&focus)
-        .element
     }
 
     //Vec<Range<AlacPoint>> -> Clip out the parts of the ranges
 
     pub fn layout_grid(
         grid: impl Iterator<Item = IndexedCell>,
+        start_line_offset: i32,
         text_style: &TextStyle,
-        // terminal_theme: &TerminalStyle,
         text_system: &WindowTextSystem,
         hyperlink: Option<(HighlightStyle, &RangeInclusive<AlacPoint>)>,
+        minimum_contrast: f32,
         window: &Window,
         cx: &App,
     ) -> (Vec<LayoutCell>, Vec<LayoutRect>) {
@@ -218,6 +220,8 @@ impl TerminalElement {
 
         let linegroups = grid.into_iter().chunk_by(|i| i.point.line);
         for (line_index, (_, line)) in linegroups.into_iter().enumerate() {
+            let alac_line = start_line_offset + line_index as i32;
+
             for cell in line {
                 let mut fg = cell.fg;
                 let mut bg = cell.bg;
@@ -245,7 +249,7 @@ impl TerminalElement {
                                         || {
                                             Some(LayoutRect::new(
                                                 AlacPoint::new(
-                                                    line_index as i32,
+                                                    alac_line,
                                                     cell.point.column.0 as i32,
                                                 ),
                                                 1,
@@ -260,10 +264,7 @@ impl TerminalElement {
                                         rects.push(cur_rect.take().unwrap());
                                     }
                                     cur_rect = Some(LayoutRect::new(
-                                        AlacPoint::new(
-                                            line_index as i32,
-                                            cell.point.column.0 as i32,
-                                        ),
+                                        AlacPoint::new(alac_line, cell.point.column.0 as i32),
                                         1,
                                         convert_color(&bg, theme),
                                     ));
@@ -272,7 +273,7 @@ impl TerminalElement {
                             None => {
                                 cur_alac_color = Some(bg);
                                 cur_rect = Some(LayoutRect::new(
-                                    AlacPoint::new(line_index as i32, cell.point.column.0 as i32),
+                                    AlacPoint::new(alac_line, cell.point.column.0 as i32),
                                     1,
                                     convert_color(&bg, theme),
                                 ));
@@ -285,8 +286,15 @@ impl TerminalElement {
                 {
                     if !is_blank(&cell) {
                         let cell_text = cell.c.to_string();
-                        let cell_style =
-                            TerminalElement::cell_style(&cell, fg, theme, text_style, hyperlink);
+                        let cell_style = TerminalElement::cell_style(
+                            &cell,
+                            fg,
+                            bg,
+                            theme,
+                            text_style,
+                            hyperlink,
+                            minimum_contrast,
+                        );
 
                         let layout_cell = text_system.shape_line(
                             cell_text.into(),
@@ -295,7 +303,7 @@ impl TerminalElement {
                         );
 
                         cells.push(LayoutCell::new(
-                            AlacPoint::new(line_index as i32, cell.point.column.0 as i32),
+                            AlacPoint::new(alac_line, cell.point.column.0 as i32),
                             layout_cell,
                         ))
                     };
@@ -341,13 +349,17 @@ impl TerminalElement {
     fn cell_style(
         indexed: &IndexedCell,
         fg: terminal::alacritty_terminal::vte::ansi::Color,
-        // bg: terminal::alacritty_terminal::ansi::Color,
+        bg: terminal::alacritty_terminal::vte::ansi::Color,
         colors: &Theme,
         text_style: &TextStyle,
         hyperlink: Option<(HighlightStyle, &RangeInclusive<AlacPoint>)>,
+        minimum_contrast: f32,
     ) -> TextRun {
         let flags = indexed.cell.flags;
         let mut fg = convert_color(&fg, colors);
+        let bg = convert_color(&bg, colors);
+
+        fg = color_contrast::ensure_minimum_contrast(fg, bg, minimum_contrast);
 
         // Ghostty uses (175/255) as the multiplier (~0.69), Alacritty uses 0.66, Kitty
         // uses 0.75. We're using 0.7 because it's pretty well in the middle of that.
@@ -430,7 +442,13 @@ impl TerminalElement {
         }
     }
 
-    fn register_mouse_listeners(&mut self, mode: TermMode, hitbox: &Hitbox, window: &mut Window) {
+    fn register_mouse_listeners(
+        &mut self,
+        mode: TermMode,
+        hitbox: &Hitbox,
+        content_mode: &ContentMode,
+        window: &mut Window,
+    ) {
         let focus = self.focus.clone();
         let terminal = self.terminal.clone();
         let terminal_view = self.terminal_view.clone();
@@ -512,14 +530,18 @@ impl TerminalElement {
             ),
         );
 
-        if !matches!(self.mode, TerminalMode::Embedded { .. }) {
+        if content_mode.is_scrollable() {
             self.interactivity.on_scroll_wheel({
                 let terminal_view = self.terminal_view.downgrade();
-                move |e, _window, cx| {
+                move |e, window, cx| {
                     terminal_view
                         .update(cx, |terminal_view, cx| {
-                            terminal_view.scroll_wheel(e, cx);
-                            cx.notify();
+                            if matches!(terminal_view.mode, TerminalMode::Standalone)
+                                || terminal_view.focus_handle.is_focused(window)
+                            {
+                                terminal_view.scroll_wheel(e, cx);
+                                cx.notify();
+                            }
                         })
                         .ok();
                 }
@@ -605,6 +627,32 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let height: Length = match self.terminal_view.read(cx).content_mode(window, cx) {
+            ContentMode::Inline {
+                displayed_lines,
+                total_lines: _,
+            } => {
+                let rem_size = window.rem_size();
+                let line_height = window.text_style().font_size.to_pixels(rem_size)
+                    * TerminalSettings::get_global(cx)
+                        .line_height
+                        .value()
+                        .to_pixels(rem_size)
+                        .0;
+                (displayed_lines * line_height).into()
+            }
+            ContentMode::Scrollable => {
+                if let TerminalMode::Embedded { .. } = &self.mode {
+                    let term = self.terminal.read(cx);
+                    if !term.scrolled_to_top() && !term.scrolled_to_bottom() && self.focused {
+                        self.interactivity.occlude_mouse();
+                    }
+                }
+
+                relative(1.).into()
+            }
+        };
+
         let layout_id = self.interactivity.request_layout(
             global_id,
             inspector_id,
@@ -612,29 +660,7 @@ impl Element for TerminalElement {
             cx,
             |mut style, window, cx| {
                 style.size.width = relative(1.).into();
-
-                match &self.mode {
-                    TerminalMode::Scrollable => {
-                        style.size.height = relative(1.).into();
-                    }
-                    TerminalMode::Embedded { max_lines } => {
-                        let rem_size = window.rem_size();
-                        let line_height = window.text_style().font_size.to_pixels(rem_size)
-                            * TerminalSettings::get_global(cx)
-                                .line_height
-                                .value()
-                                .to_pixels(rem_size)
-                                .0;
-
-                        let mut line_count = self.terminal.read(cx).total_lines();
-                        if !self.focused {
-                            if let Some(max_lines) = max_lines {
-                                line_count = line_count.min(*max_lines);
-                            }
-                        }
-                        style.size.height = (line_count * line_height).into();
-                    }
-                }
+                style.size.height = height;
 
                 window.request_layout(style, None, cx)
             },
@@ -666,12 +692,12 @@ impl Element for TerminalElement {
                 let buffer_font_size = settings.buffer_font_size(cx);
 
                 let terminal_settings = TerminalSettings::get_global(cx);
+                let minimum_contrast = terminal_settings.minimum_contrast;
 
-                let font_family = terminal_settings
-                    .font_family
-                    .as_ref()
-                    .unwrap_or(&settings.buffer_font.family)
-                    .clone();
+                let font_family = terminal_settings.font_family.as_ref().map_or_else(
+                    || settings.buffer_font.family.clone(),
+                    |font_family| font_family.0.clone().into(),
+                );
 
                 let font_fallbacks = terminal_settings
                     .font_fallbacks
@@ -693,7 +719,7 @@ impl Element for TerminalElement {
                     TerminalMode::Embedded { .. } => {
                         window.text_style().font_size.to_pixels(window.rem_size())
                     }
-                    TerminalMode::Scrollable => terminal_settings
+                    TerminalMode::Standalone => terminal_settings
                         .font_size
                         .map_or(buffer_font_size, |size| theme::adjusted_font_size(size, cx)),
                 };
@@ -733,7 +759,7 @@ impl Element for TerminalElement {
                 let player_color = theme.players().local();
                 let match_color = theme.colors().search_match_background;
                 let gutter;
-                let dimensions = {
+                let (dimensions, line_height_px) = {
                     let rem_size = window.rem_size();
                     let font_pixels = text_style.font_size.to_pixels(rem_size);
                     // TODO: line_height should be an f32 not an AbsoluteLength.
@@ -759,7 +785,10 @@ impl Element for TerminalElement {
                     let mut origin = bounds.origin;
                     origin.x += gutter;
 
-                    TerminalBounds::new(line_height, cell_width, Bounds { origin, size })
+                    (
+                        TerminalBounds::new(line_height, cell_width, Bounds { origin, size }),
+                        line_height,
+                    )
                 };
 
                 let search_matches = self.terminal.read(cx).matches.clone();
@@ -827,16 +856,44 @@ impl Element for TerminalElement {
 
                 // then have that representation be converted to the appropriate highlight data structure
 
-                let (cells, rects) = TerminalElement::layout_grid(
-                    cells.iter().cloned(),
-                    &text_style,
-                    window.text_system(),
-                    last_hovered_word
-                        .as_ref()
-                        .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
-                    window,
-                    cx,
-                );
+                let content_mode = self.terminal_view.read(cx).content_mode(window, cx);
+                let (cells, rects) = match content_mode {
+                    ContentMode::Scrollable => TerminalElement::layout_grid(
+                        cells.iter().cloned(),
+                        0,
+                        &text_style,
+                        window.text_system(),
+                        last_hovered_word
+                            .as_ref()
+                            .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
+                        minimum_contrast,
+                        window,
+                        cx,
+                    ),
+                    ContentMode::Inline { .. } => {
+                        let intersection = window.content_mask().bounds.intersect(&bounds);
+                        let start_row = (intersection.top() - bounds.top()) / line_height_px;
+                        let end_row = start_row + intersection.size.height / line_height_px;
+                        let line_range = (start_row as i32)..=(end_row as i32);
+
+                        TerminalElement::layout_grid(
+                            cells
+                                .iter()
+                                .skip_while(|i| &i.point.line < line_range.start())
+                                .take_while(|i| &i.point.line <= line_range.end())
+                                .cloned(),
+                            *line_range.start(),
+                            &text_style,
+                            window.text_system(),
+                            last_hovered_word.as_ref().map(|last_hovered_word| {
+                                (link_style, &last_hovered_word.word_match)
+                            }),
+                            minimum_contrast,
+                            window,
+                            cx,
+                        )
+                    }
+                };
 
                 // Layout cursor. Rectangle is used for IME, so we should lay it out even
                 // if we don't end up showing it.
@@ -932,6 +989,7 @@ impl Element for TerminalElement {
                     gutter,
                     block_below_cursor_element,
                     base_text_style: text_style,
+                    content_mode,
                 }
             },
         )
@@ -969,7 +1027,12 @@ impl Element for TerminalElement {
                 workspace: self.workspace.clone(),
             };
 
-            self.register_mouse_listeners(layout.mode, &layout.hitbox, window);
+            self.register_mouse_listeners(
+                layout.mode,
+                &layout.hitbox,
+                &layout.content_mode,
+                window,
+            );
             if window.modifiers().secondary()
                 && bounds.contains(&window.mouse_position())
                 && self.terminal_view.read(cx).hover.is_some()
@@ -1022,7 +1085,7 @@ impl Element for TerminalElement {
                                 color: *color,
                                 corner_radius: 0.15 * layout.dimensions.line_height,
                             };
-                            hr.paint(bounds, window);
+                            hr.paint(true, bounds, window);
                         }
                     }
 
@@ -1340,5 +1403,124 @@ pub fn convert_color(fg: &terminal::alacritty_terminal::vte::ansi::Color, theme:
         terminal::alacritty_terminal::vte::ansi::Color::Indexed(i) => {
             terminal::get_color_at_index(*i as usize, theme)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_contrast_adjustment_logic() {
+        // Test the core contrast adjustment logic without needing full app context
+
+        // Test case 1: Light colors (poor contrast)
+        let white_fg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 1.0,
+            a: 1.0,
+        };
+        let light_gray_bg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.95,
+            a: 1.0,
+        };
+
+        // Should have poor contrast
+        let actual_contrast = color_contrast::apca_contrast(white_fg, light_gray_bg).abs();
+        assert!(
+            actual_contrast < 30.0,
+            "White on light gray should have poor APCA contrast: {}",
+            actual_contrast
+        );
+
+        // After adjustment with minimum APCA contrast of 45, should be darker
+        let adjusted = color_contrast::ensure_minimum_contrast(white_fg, light_gray_bg, 45.0);
+        assert!(
+            adjusted.l < white_fg.l,
+            "Adjusted color should be darker than original"
+        );
+        let adjusted_contrast = color_contrast::apca_contrast(adjusted, light_gray_bg).abs();
+        assert!(adjusted_contrast >= 45.0, "Should meet minimum contrast");
+
+        // Test case 2: Dark colors (poor contrast)
+        let black_fg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.0,
+            a: 1.0,
+        };
+        let dark_gray_bg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.05,
+            a: 1.0,
+        };
+
+        // Should have poor contrast
+        let actual_contrast = color_contrast::apca_contrast(black_fg, dark_gray_bg).abs();
+        assert!(
+            actual_contrast < 30.0,
+            "Black on dark gray should have poor APCA contrast: {}",
+            actual_contrast
+        );
+
+        // After adjustment with minimum APCA contrast of 45, should be lighter
+        let adjusted = color_contrast::ensure_minimum_contrast(black_fg, dark_gray_bg, 45.0);
+        assert!(
+            adjusted.l > black_fg.l,
+            "Adjusted color should be lighter than original"
+        );
+        let adjusted_contrast = color_contrast::apca_contrast(adjusted, dark_gray_bg).abs();
+        assert!(adjusted_contrast >= 45.0, "Should meet minimum contrast");
+
+        // Test case 3: Already good contrast
+        let good_contrast = color_contrast::ensure_minimum_contrast(black_fg, white_fg, 45.0);
+        assert_eq!(
+            good_contrast, black_fg,
+            "Good contrast should not be adjusted"
+        );
+    }
+
+    #[test]
+    fn test_white_on_white_contrast_issue() {
+        // This test reproduces the exact issue from the bug report
+        // where white ANSI text on white background should be adjusted
+
+        // Simulate One Light theme colors
+        let white_fg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.98, // #fafafaff is approximately 98% lightness
+            a: 1.0,
+        };
+        let white_bg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.98, // Same as foreground - this is the problem!
+            a: 1.0,
+        };
+
+        // With minimum contrast of 0.0, no adjustment should happen
+        let no_adjust = color_contrast::ensure_minimum_contrast(white_fg, white_bg, 0.0);
+        assert_eq!(no_adjust, white_fg, "No adjustment with min_contrast 0.0");
+
+        // With minimum APCA contrast of 15, it should adjust to a darker color
+        let adjusted = color_contrast::ensure_minimum_contrast(white_fg, white_bg, 15.0);
+        assert!(
+            adjusted.l < white_fg.l,
+            "White on white should become darker, got l={}",
+            adjusted.l
+        );
+
+        // Verify the contrast is now acceptable
+        let new_contrast = color_contrast::apca_contrast(adjusted, white_bg).abs();
+        assert!(
+            new_contrast >= 15.0,
+            "Adjusted APCA contrast {} should be >= 15.0",
+            new_contrast
+        );
     }
 }

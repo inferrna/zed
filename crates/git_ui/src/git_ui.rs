@@ -10,7 +10,7 @@ use git::{
     status::{FileStatus, StatusCode, UnmergedStatus, UnmergedStatusCode},
 };
 use git_panel_settings::GitPanelSettings;
-use gpui::{Action, App, FocusHandle, actions};
+use gpui::{Action, App, Context, FocusHandle, Window, actions};
 use onboarding::GitOnboardingModal;
 use project_diff::ProjectDiff;
 use ui::prelude::*;
@@ -22,6 +22,7 @@ mod commit_modal;
 pub mod commit_tooltip;
 mod commit_view;
 mod conflict_view;
+pub mod diff_view;
 pub mod git_panel;
 mod git_panel_settings;
 pub mod onboarding;
@@ -30,7 +31,13 @@ pub mod project_diff;
 pub(crate) mod remote_output;
 pub mod repository_selector;
 
-actions!(git, [ResetOnboarding]);
+actions!(
+    git,
+    [
+        /// Resets the git onboarding state to show the tutorial again.
+        ResetOnboarding
+    ]
+);
 
 pub fn init(cx: &mut App) {
     GitPanelSettings::register(cx);
@@ -142,8 +149,39 @@ pub fn init(cx: &mut App) {
                 panel.git_init(window, cx);
             });
         });
+        workspace.register_action(|workspace, _: &git::OpenModifiedFiles, window, cx| {
+            open_modified_files(workspace, window, cx);
+        });
     })
     .detach();
+}
+
+fn open_modified_files(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+        return;
+    };
+    let modified_paths: Vec<_> = panel.update(cx, |panel, cx| {
+        let Some(repo) = panel.active_repository.as_ref() else {
+            return Vec::new();
+        };
+        let repo = repo.read(cx);
+        repo.cached_status()
+            .filter_map(|entry| {
+                if entry.status.is_modified() {
+                    repo.repo_path_to_project_path(&entry.repo_path, cx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    });
+    for path in modified_paths {
+        workspace.open_path(path, None, true, window, cx).detach();
+    }
 }
 
 pub fn git_status_icon(status: FileStatus) -> impl IntoElement {

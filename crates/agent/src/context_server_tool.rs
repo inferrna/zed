@@ -4,9 +4,9 @@ use anyhow::{Result, anyhow, bail};
 use assistant_tool::{ActionLog, Tool, ToolResult, ToolSource};
 use context_server::{ContextServerId, types};
 use gpui::{AnyWindowHandle, App, Entity, Task};
+use icons::IconName;
 use language_model::{LanguageModel, LanguageModelRequest, LanguageModelToolSchemaFormat};
 use project::{Project, context_server_store::ContextServerStore};
-use ui::IconName;
 
 pub struct ContextServerTool {
     store: Entity<ContextServerStore>,
@@ -105,7 +105,7 @@ impl Tool for ContextServerTool {
                     arguments
                 );
                 let response = protocol
-                    .request::<context_server::types::request::CallTool>(
+                    .request::<context_server::types::requests::CallTool>(
                         context_server::types::CallToolParams {
                             name: tool_name,
                             arguments,
