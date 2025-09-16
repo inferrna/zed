@@ -626,6 +626,7 @@ pub enum ClientNotification {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CancelledParams {
     pub request_id: RequestId,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -685,6 +686,18 @@ pub struct CallToolResponse {
     pub structured_content: Option<serde_json::Value>,
 }
 
+impl CallToolResponse {
+    pub fn text_contents(&self) -> String {
+        let mut text = String::new();
+        for chunk in &self.content {
+            if let ToolResponseContent::Text { text: chunk } = chunk {
+                text.push_str(chunk)
+            };
+        }
+        text
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToolResponseContent {
@@ -696,6 +709,16 @@ pub enum ToolResponseContent {
     Audio { data: String, mime_type: String },
     #[serde(rename = "resource")]
     Resource { resource: ResourceContents },
+}
+
+impl ToolResponseContent {
+    pub fn text(&self) -> Option<&str> {
+        if let ToolResponseContent::Text { text } = self {
+            Some(text)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
