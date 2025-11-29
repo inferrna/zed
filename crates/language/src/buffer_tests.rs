@@ -1,8 +1,5 @@
 use super::*;
 use crate::Buffer;
-use crate::language_settings::{
-    AllLanguageSettings, AllLanguageSettingsContent, LanguageSettingsContent,
-};
 use clock::ReplicaId;
 use collections::BTreeMap;
 use futures::FutureExt as _;
@@ -13,6 +10,7 @@ use proto::deserialize_operation;
 use rand::prelude::*;
 use regex::RegexBuilder;
 use settings::SettingsStore;
+use settings::{AllLanguageSettingsContent, LanguageSettingsContent};
 use std::collections::BTreeSet;
 use std::{
     env,
@@ -26,6 +24,7 @@ use text::{BufferId, LineEnding};
 use text::{Point, ToPoint};
 use theme::ActiveTheme;
 use unindent::Unindent as _;
+use util::rel_path::rel_path;
 use util::test::marked_text_offsets;
 use util::{RandomCharIter, assert_set_eq, post_inc, test::marked_text_ranges};
 
@@ -71,7 +70,13 @@ fn test_line_endings(cx: &mut gpui::App) {
 fn test_set_line_ending(cx: &mut TestAppContext) {
     let base = cx.new(|cx| Buffer::local("one\ntwo\nthree\n", cx));
     let base_replica = cx.new(|cx| {
-        Buffer::from_proto(1, Capability::ReadWrite, base.read(cx).to_proto(cx), None).unwrap()
+        Buffer::from_proto(
+            ReplicaId::new(1),
+            Capability::ReadWrite,
+            base.read(cx).to_proto(cx),
+            None,
+        )
+        .unwrap()
     });
     base.update(cx, |_buffer, cx| {
         cx.subscribe(&base_replica, |this, _, event, cx| {
@@ -270,16 +275,16 @@ async fn test_first_line_pattern(cx: &mut TestAppContext) {
 async fn test_language_for_file_with_custom_file_types(cx: &mut TestAppContext) {
     cx.update(|cx| {
         init_settings(cx, |settings| {
-            settings.file_types.extend([
-                ("TypeScript".into(), vec!["js".into()]),
+            settings.file_types.get_or_insert_default().extend([
+                ("TypeScript".into(), vec!["js".into()].into()),
                 (
                     "JavaScript".into(),
-                    vec!["*longer.ts".into(), "ecmascript".into()],
+                    vec!["*longer.ts".into(), "ecmascript".into()].into(),
                 ),
-                ("C++".into(), vec!["c".into(), "*.dev".into()]),
+                ("C++".into(), vec!["c".into(), "*.dev".into()].into()),
                 (
                     "Dockerfile".into(),
-                    vec!["Dockerfile".into(), "Dockerfile.*".into()],
+                    vec!["Dockerfile".into(), "Dockerfile.*".into()].into(),
                 ),
             ]);
         })
@@ -382,7 +387,7 @@ async fn test_language_for_file_with_custom_file_types(cx: &mut TestAppContext) 
 
 fn file(path: &str) -> Arc<dyn File> {
     Arc::new(TestFile {
-        path: Path::new(path).into(),
+        path: Arc::from(rel_path(path)),
         root_name: "zed".into(),
         local_root: None,
     })
@@ -398,7 +403,7 @@ fn test_edit_events(cx: &mut gpui::App) {
     let buffer2 = cx.new(|cx| {
         Buffer::remote(
             BufferId::from(cx.entity_id().as_non_zero_u64()),
-            1,
+            ReplicaId::new(1),
             Capability::ReadWrite,
             "abcdef",
         )
@@ -1054,6 +1059,21 @@ async fn test_symbols_containing(cx: &mut gpui::TestAppContext) {
             })
             .collect()
     }
+
+    let (text, offsets) = marked_text_offsets(
+        &"
+        // ˇ😅 //
+        fn test() {
+        }
+    "
+        .unindent(),
+    );
+    let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
+    let snapshot = buffer.update(cx, |buffer, _| buffer.snapshot());
+
+    // note, it would be nice to actually return the method test in this
+    // case, but primarily asserting we don't crash because of the multibyte character.
+    assert_eq!(snapshot.symbols_containing(offsets[0], None), vec![]);
 }
 
 #[gpui::test]
@@ -1091,9 +1111,10 @@ fn test_text_objects(cx: &mut App) {
 
 #[gpui::test]
 fn test_enclosing_bracket_ranges(cx: &mut App) {
-    let mut assert = |selection_text, range_markers| {
+    #[track_caller]
+    fn assert(selection_text: &'static str, range_markers: Vec<&'static str>, cx: &mut App) {
         assert_bracket_pairs(selection_text, range_markers, rust_lang(), cx)
-    };
+    }
 
     assert(
         indoc! {"
@@ -1110,6 +1131,7 @@ fn test_enclosing_bracket_ranges(cx: &mut App) {
                 }
             «}»
             let foo = 1;"}],
+        cx,
     );
 
     assert(
@@ -1136,6 +1158,7 @@ fn test_enclosing_bracket_ranges(cx: &mut App) {
                 }
                 let foo = 1;"},
         ],
+        cx,
     );
 
     assert(
@@ -1162,6 +1185,7 @@ fn test_enclosing_bracket_ranges(cx: &mut App) {
                 }
                 let foo = 1;"},
         ],
+        cx,
     );
 
     assert(
@@ -1179,6 +1203,7 @@ fn test_enclosing_bracket_ranges(cx: &mut App) {
                 }
             «}»
             let foo = 1;"}],
+        cx,
     );
 
     assert(
@@ -1189,7 +1214,8 @@ fn test_enclosing_bracket_ranges(cx: &mut App) {
                 }
             }
             let fˇoo = 1;"},
-        vec![],
+        Vec::new(),
+        cx,
     );
 
     // Regression test: avoid crash when querying at the end of the buffer.
@@ -1201,7 +1227,8 @@ fn test_enclosing_bracket_ranges(cx: &mut App) {
                 }
             }
             let foo = 1;ˇ"},
-        vec![],
+        Vec::new(),
+        cx,
     );
 }
 
@@ -2613,7 +2640,7 @@ fn test_language_scope_at_with_combined_injections(cx: &mut App) {
         buffer.set_language_registry(language_registry.clone());
         buffer.set_language(
             language_registry
-                .language_for_name("ERB")
+                .language_for_name("HTML+ERB")
                 .now_or_never()
                 .unwrap()
                 .ok(),
@@ -2734,6 +2761,50 @@ fn test_language_at_for_markdown_code_block(cx: &mut App) {
 }
 
 #[gpui::test]
+fn test_syntax_layer_at_for_injected_languages(cx: &mut App) {
+    init_settings(cx, |_| {});
+
+    cx.new(|cx| {
+        let text = r#"
+            ```html+erb
+            <div>Hello</div>
+            <%= link_to "Some", "https://zed.dev" %>
+            ```
+        "#
+        .unindent();
+
+        let language_registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+        language_registry.add(Arc::new(erb_lang()));
+        language_registry.add(Arc::new(html_lang()));
+        language_registry.add(Arc::new(ruby_lang()));
+
+        let mut buffer = Buffer::local(text, cx);
+        buffer.set_language_registry(language_registry.clone());
+        buffer.set_language(
+            language_registry
+                .language_for_name("HTML+ERB")
+                .now_or_never()
+                .unwrap()
+                .ok(),
+            cx,
+        );
+
+        let snapshot = buffer.snapshot();
+
+        // Test points in the code line
+        let html_point = Point::new(1, 4);
+        let language = snapshot.language_at(html_point).unwrap();
+        assert_eq!(language.name().as_ref(), "HTML");
+
+        let ruby_point = Point::new(2, 6);
+        let language = snapshot.language_at(ruby_point).unwrap();
+        assert_eq!(language.name().as_ref(), "Ruby");
+
+        buffer
+    });
+}
+
+#[gpui::test]
 fn test_serialization(cx: &mut gpui::App) {
     let mut now = Instant::now();
 
@@ -2761,7 +2832,8 @@ fn test_serialization(cx: &mut gpui::App) {
         .background_executor()
         .block(buffer1.read(cx).serialize_ops(None, cx));
     let buffer2 = cx.new(|cx| {
-        let mut buffer = Buffer::from_proto(1, Capability::ReadWrite, state, None).unwrap();
+        let mut buffer =
+            Buffer::from_proto(ReplicaId::new(1), Capability::ReadWrite, state, None).unwrap();
         buffer.apply_ops(
             ops.into_iter()
                 .map(|op| proto::deserialize_operation(op).unwrap()),
@@ -2780,7 +2852,13 @@ fn test_branch_and_merge(cx: &mut TestAppContext) {
 
     // Create a remote replica of the base buffer.
     let base_replica = cx.new(|cx| {
-        Buffer::from_proto(1, Capability::ReadWrite, base.read(cx).to_proto(cx), None).unwrap()
+        Buffer::from_proto(
+            ReplicaId::new(1),
+            Capability::ReadWrite,
+            base.read(cx).to_proto(cx),
+            None,
+        )
+        .unwrap()
     });
     base.update(cx, |_buffer, cx| {
         cx.subscribe(&base_replica, |this, _, event, cx| {
@@ -3049,15 +3127,13 @@ async fn test_preview_edits(cx: &mut TestAppContext) {
                 .map(|(range, text)| {
                     (
                         buffer.anchor_before(range.start)..buffer.anchor_after(range.end),
-                        text.to_string(),
+                        text.into(),
                     )
                 })
-                .collect::<Vec<_>>()
+                .collect::<Arc<[_]>>()
         });
         let edit_preview = buffer
-            .read_with(cx, |buffer, cx| {
-                buffer.preview_edits(edits.clone().into(), cx)
-            })
+            .read_with(cx, |buffer, cx| buffer.preview_edits(edits.clone(), cx))
             .await;
         let highlighted_edits = cx.read(|cx| {
             edit_preview.highlight_edits(&buffer.read(cx).snapshot(), &edits, include_deletions, cx)
@@ -3094,7 +3170,8 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                 .background_executor()
                 .block(base_buffer.read(cx).serialize_ops(None, cx));
             let mut buffer =
-                Buffer::from_proto(i as ReplicaId, Capability::ReadWrite, state, None).unwrap();
+                Buffer::from_proto(ReplicaId::new(i as u16), Capability::ReadWrite, state, None)
+                    .unwrap();
             buffer.apply_ops(
                 ops.into_iter()
                     .map(|op| proto::deserialize_operation(op).unwrap()),
@@ -3119,9 +3196,9 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
         });
 
         buffers.push(buffer);
-        replica_ids.push(i as ReplicaId);
-        network.lock().add_peer(i as ReplicaId);
-        log::info!("Adding initial peer with replica id {}", i);
+        replica_ids.push(ReplicaId::new(i as u16));
+        network.lock().add_peer(ReplicaId::new(i as u16));
+        log::info!("Adding initial peer with replica id {:?}", replica_ids[i]);
     }
 
     log::info!("initial text: {:?}", base_text);
@@ -3141,14 +3218,14 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                     buffer.start_transaction_at(now);
                     buffer.randomly_edit(&mut rng, 5, cx);
                     buffer.end_transaction_at(now, cx);
-                    log::info!("buffer {} text: {:?}", buffer.replica_id(), buffer.text());
+                    log::info!("buffer {:?} text: {:?}", buffer.replica_id(), buffer.text());
                 });
                 mutation_count -= 1;
             }
             30..=39 if mutation_count != 0 => {
                 buffer.update(cx, |buffer, cx| {
                     if rng.random_bool(0.2) {
-                        log::info!("peer {} clearing active selections", replica_id);
+                        log::info!("peer {:?} clearing active selections", replica_id);
                         active_selections.remove(&replica_id);
                         buffer.remove_active_selections(cx);
                     } else {
@@ -3165,7 +3242,7 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                         }
                         let selections: Arc<[Selection<Anchor>]> = selections.into();
                         log::info!(
-                            "peer {} setting active selections: {:?}",
+                            "peer {:?} setting active selections: {:?}",
                             replica_id,
                             selections
                         );
@@ -3175,7 +3252,7 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                 });
                 mutation_count -= 1;
             }
-            40..=49 if mutation_count != 0 && replica_id == 0 => {
+            40..=49 if mutation_count != 0 && replica_id == ReplicaId::REMOTE_SERVER => {
                 let entry_count = rng.random_range(1..=5);
                 buffer.update(cx, |buffer, cx| {
                     let diagnostics = DiagnosticSet::new(
@@ -3193,7 +3270,11 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                         }),
                         buffer,
                     );
-                    log::info!("peer {} setting diagnostics: {:?}", replica_id, diagnostics);
+                    log::info!(
+                        "peer {:?} setting diagnostics: {:?}",
+                        replica_id,
+                        diagnostics
+                    );
                     buffer.update_diagnostics(LanguageServerId(0), diagnostics, cx);
                 });
                 mutation_count -= 1;
@@ -3203,12 +3284,13 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                 let old_buffer_ops = cx
                     .background_executor()
                     .block(buffer.read(cx).serialize_ops(None, cx));
-                let new_replica_id = (0..=replica_ids.len() as ReplicaId)
+                let new_replica_id = (0..=replica_ids.len() as u16)
+                    .map(ReplicaId::new)
                     .filter(|replica_id| *replica_id != buffer.read(cx).replica_id())
                     .choose(&mut rng)
                     .unwrap();
                 log::info!(
-                    "Adding new replica {} (replicating from {})",
+                    "Adding new replica {:?} (replicating from {:?})",
                     new_replica_id,
                     replica_id
                 );
@@ -3227,7 +3309,7 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                         cx,
                     );
                     log::info!(
-                        "New replica {} text: {:?}",
+                        "New replica {:?} text: {:?}",
                         new_buffer.replica_id(),
                         new_buffer.text()
                     );
@@ -3250,7 +3332,7 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                 }));
                 network.lock().replicate(replica_id, new_replica_id);
 
-                if new_replica_id as usize == replica_ids.len() {
+                if new_replica_id.as_u16() as usize == replica_ids.len() {
                     replica_ids.push(new_replica_id);
                 } else {
                     let new_buffer = new_buffer.take().unwrap();
@@ -3262,7 +3344,7 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                             .map(|op| proto::deserialize_operation(op).unwrap());
                         if ops.len() > 0 {
                             log::info!(
-                                "peer {} (version: {:?}) applying {} ops from the network. {:?}",
+                                "peer {:?} (version: {:?}) applying {} ops from the network. {:?}",
                                 new_replica_id,
                                 buffer.read(cx).version(),
                                 ops.len(),
@@ -3273,13 +3355,13 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                             });
                         }
                     }
-                    buffers[new_replica_id as usize] = new_buffer;
+                    buffers[new_replica_id.as_u16() as usize] = new_buffer;
                 }
             }
             60..=69 if mutation_count != 0 => {
                 buffer.update(cx, |buffer, cx| {
                     buffer.randomly_undo_redo(&mut rng, cx);
-                    log::info!("buffer {} text: {:?}", buffer.replica_id(), buffer.text());
+                    log::info!("buffer {:?} text: {:?}", buffer.replica_id(), buffer.text());
                 });
                 mutation_count -= 1;
             }
@@ -3291,7 +3373,7 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                     .map(|op| proto::deserialize_operation(op).unwrap());
                 if ops.len() > 0 {
                     log::info!(
-                        "peer {} (version: {:?}) applying {} ops from the network. {:?}",
+                        "peer {:?} (version: {:?}) applying {} ops from the network. {:?}",
                         replica_id,
                         buffer.read(cx).version(),
                         ops.len(),
@@ -3321,13 +3403,13 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
         assert_eq!(
             buffer.version(),
             first_buffer.version(),
-            "Replica {} version != Replica 0 version",
+            "Replica {:?} version != Replica 0 version",
             buffer.replica_id()
         );
         assert_eq!(
             buffer.text(),
             first_buffer.text(),
-            "Replica {} text != Replica 0 text",
+            "Replica {:?} text != Replica 0 text",
             buffer.replica_id()
         );
         assert_eq!(
@@ -3337,7 +3419,7 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
             first_buffer
                 .diagnostics_in_range::<_, usize>(0..first_buffer.len(), false)
                 .collect::<Vec<_>>(),
-            "Replica {} diagnostics != Replica 0 diagnostics",
+            "Replica {:?} diagnostics != Replica 0 diagnostics",
             buffer.replica_id()
         );
     }
@@ -3345,7 +3427,7 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
     for buffer in &buffers {
         let buffer = buffer.read(cx).snapshot();
         let actual_remote_selections = buffer
-            .selections_in_range(Anchor::MIN..Anchor::MAX, false)
+            .selections_in_range(Anchor::min_max_range_for_buffer(buffer.remote_id()), false)
             .map(|(replica_id, _, _, selections)| (replica_id, selections.collect::<Vec<_>>()))
             .collect::<Vec<_>>();
         let expected_remote_selections = active_selections
@@ -3356,7 +3438,7 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
         assert_eq!(
             actual_remote_selections,
             expected_remote_selections,
-            "Replica {} remote selections != expected selections",
+            "Replica {:?} remote selections != expected selections",
             buffer.replica_id()
         );
     }
@@ -3378,6 +3460,25 @@ fn test_contiguous_ranges() {
         .collect::<Vec<_>>(),
         &[2..5, 5..8, 8..10, 23..26, 26..27, 30..32],
     );
+}
+
+#[gpui::test]
+fn test_insertion_after_deletion(cx: &mut gpui::App) {
+    let buffer = cx.new(|cx| Buffer::local("struct Foo {\n    \n}", cx));
+    buffer.update(cx, |buffer, cx| {
+        let mut anchor = buffer.anchor_after(17);
+        buffer.edit([(12..18, "")], None, cx);
+        let snapshot = buffer.snapshot();
+        assert_eq!(snapshot.text(), "struct Foo {}");
+        if !anchor.is_valid(&snapshot) {
+            anchor = snapshot.anchor_after(snapshot.offset_for_anchor(&anchor));
+        }
+        buffer.edit([(anchor..anchor, "\n")], None, cx);
+        buffer.edit([(anchor..anchor, "field1:")], None, cx);
+        buffer.edit([(anchor..anchor, " i32,")], None, cx);
+        let snapshot = buffer.snapshot();
+        assert_eq!(snapshot.text(), "struct Foo {\nfield1: i32,}");
+    })
 }
 
 #[gpui::test(iterations = 500)]
@@ -3622,7 +3723,7 @@ fn html_lang() -> Language {
 fn erb_lang() -> Language {
     Language::new(
         LanguageConfig {
-            name: "ERB".into(),
+            name: "HTML+ERB".into(),
             matcher: LanguageMatcher {
                 path_suffixes: vec!["erb".to_string()],
                 ..Default::default()
@@ -3640,15 +3741,15 @@ fn erb_lang() -> Language {
     .with_injection_query(
         r#"
             (
-                (code) @injection.content
-                (#set! injection.language "ruby")
-                (#set! injection.combined)
+                (code) @content
+                (#set! "language" "ruby")
+                (#set! "combined")
             )
 
             (
-                (content) @injection.content
-                (#set! injection.language "html")
-                (#set! injection.combined)
+                (content) @content
+                (#set! "language" "html")
+                (#set! "combined")
             )
         "#,
     )
@@ -3847,9 +3948,8 @@ fn assert_bracket_pairs(
 fn init_settings(cx: &mut App, f: fn(&mut AllLanguageSettingsContent)) {
     let settings_store = SettingsStore::test(cx);
     cx.set_global(settings_store);
-    crate::init(cx);
     cx.update_global::<SettingsStore, _>(|settings, cx| {
-        settings.update_user_settings::<AllLanguageSettings>(cx, f);
+        settings.update_user_settings(cx, |content| f(&mut content.project.all_languages));
     });
 }
 

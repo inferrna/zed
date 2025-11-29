@@ -379,7 +379,7 @@ fn worktree_context(worktree_abs_path: &Path) -> TaskContext {
     let mut task_variables = TaskVariables::default();
     task_variables.insert(
         VariableName::WorktreeRoot,
-        worktree_abs_path.to_string_lossy().to_string(),
+        worktree_abs_path.to_string_lossy().into_owned(),
     );
     TaskContext {
         cwd: Some(worktree_abs_path.to_path_buf()),
@@ -392,14 +392,14 @@ fn worktree_context(worktree_abs_path: &Path) -> TaskContext {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use editor::{Editor, SelectionEffects};
+    use editor::{Editor, MultiBufferOffset, SelectionEffects};
     use gpui::TestAppContext;
     use language::{Language, LanguageConfig};
     use project::{BasicContextProvider, FakeFs, Project, task_store::TaskStore};
     use serde_json::json;
     use task::{TaskContext, TaskVariables, VariableName};
     use ui::VisualContext;
-    use util::path;
+    use util::{path, rel_path::rel_path};
     use workspace::{AppState, Workspace};
 
     use crate::task_contexts;
@@ -479,8 +479,9 @@ mod tests {
 
         let buffer1 = workspace
             .update(cx, |this, cx| {
-                this.project()
-                    .update(cx, |this, cx| this.open_buffer((worktree_id, "a.ts"), cx))
+                this.project().update(cx, |this, cx| {
+                    this.open_buffer((worktree_id, rel_path("a.ts")), cx)
+                })
             })
             .await
             .unwrap();
@@ -493,7 +494,7 @@ mod tests {
         let buffer2 = workspace
             .update(cx, |this, cx| {
                 this.project().update(cx, |this, cx| {
-                    this.open_buffer((worktree_id, "rust/b.rs"), cx)
+                    this.open_buffer((worktree_id, rel_path("rust/b.rs")), cx)
                 })
             })
             .await
@@ -538,7 +539,7 @@ mod tests {
         // And now, let's select an identifier.
         editor2.update_in(cx, |editor, window, cx| {
             editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
-                selections.select_ranges([14..18])
+                selections.select_ranges([MultiBufferOffset(14)..MultiBufferOffset(18)])
             })
         });
 
@@ -601,11 +602,8 @@ mod tests {
     pub(crate) fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
             let state = AppState::test(cx);
-            language::init(cx);
             crate::init(cx);
             editor::init(cx);
-            workspace::init_settings(cx);
-            Project::init_settings(cx);
             TaskStore::init(None);
             state
         })

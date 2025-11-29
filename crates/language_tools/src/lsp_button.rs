@@ -21,6 +21,7 @@ use ui::{
     DocumentationSide, Indicator, PopoverMenu, PopoverMenuHandle, Tooltip, Window, prelude::*,
 };
 
+use util::{ResultExt, rel_path::RelPath};
 use workspace::{StatusItemView, Workspace};
 
 use crate::lsp_log_view;
@@ -93,7 +94,7 @@ struct LanguageServerBinaryStatus {
 #[derive(Debug)]
 struct ServerInfo {
     name: LanguageServerName,
-    id: Option<LanguageServerId>,
+    id: LanguageServerId,
     health: Option<ServerHealth>,
     binary_status: Option<LanguageServerBinaryStatus>,
     message: Option<SharedString>,
@@ -101,9 +102,7 @@ struct ServerInfo {
 
 impl ServerInfo {
     fn server_selector(&self) -> LanguageServerSelector {
-        self.id
-            .map(LanguageServerSelector::Id)
-            .unwrap_or_else(|| LanguageServerSelector::Name(self.name.clone()))
+        LanguageServerSelector::Id(self.id)
     }
 }
 
@@ -148,6 +147,7 @@ impl LanguageServerState {
                                         return;
                                     };
                                     let project = workspace.read(cx).project().clone();
+                                    let path_style = project.read(cx).path_style(cx);
                                     let buffer_store = project.read(cx).buffer_store().clone();
                                     let buffers = state
                                         .read(cx)
@@ -159,6 +159,9 @@ impl LanguageServerState {
                                                 servers.worktree.as_ref()?.upgrade()?.read(cx);
                                             let relative_path =
                                                 abs_path.strip_prefix(&worktree.abs_path()).ok()?;
+                                            let relative_path =
+                                                RelPath::new(relative_path, path_style)
+                                                    .log_err()?;
                                             let entry = worktree.entry_for_path(&relative_path)?;
                                             let project_path =
                                                 project.read(cx).path_for_entry(entry.id, cx)?;
@@ -209,7 +212,6 @@ impl LanguageServerState {
             let Some(server_info) = item.server_info() else {
                 continue;
             };
-
             let server_selector = server_info.server_selector();
             let is_remote = self
                 .lsp_store
@@ -425,7 +427,7 @@ enum ServerData<'a> {
         binary_status: Option<&'a LanguageServerBinaryStatus>,
     },
     WithBinaryStatus {
-        server_id: Option<LanguageServerId>,
+        server_id: LanguageServerId,
         server_name: &'a LanguageServerName,
         binary_status: &'a LanguageServerBinaryStatus,
     },
@@ -439,7 +441,7 @@ enum LspMenuItem {
         binary_status: Option<LanguageServerBinaryStatus>,
     },
     WithBinaryStatus {
-        server_id: Option<LanguageServerId>,
+        server_id: LanguageServerId,
         server_name: LanguageServerName,
         binary_status: LanguageServerBinaryStatus,
     },
@@ -464,7 +466,7 @@ impl LspMenuItem {
                 ..
             } => Some(ServerInfo {
                 name: health.name.clone(),
-                id: Some(*server_id),
+                id: *server_id,
                 health: health.health(),
                 binary_status: binary_status.clone(),
                 message: health.message(),
@@ -586,6 +588,8 @@ impl LspButton {
         };
         let mut updated = false;
 
+        // TODO `LspStore` is global and reports status from all language servers, even from the other windows.
+        // Also, we do not get "LSP removed" events so LSPs are never removed.
         match e {
             LspStoreEvent::LanguageServerUpdate {
                 language_server_id,
@@ -753,7 +757,6 @@ impl LspButton {
                 .ok();
 
             let mut servers_per_worktree = BTreeMap::<SharedString, Vec<ServerData>>::new();
-            let mut servers_without_worktree = Vec::<ServerData>::new();
             let mut servers_with_health_checks = HashSet::default();
 
             for (server_id, health) in &state.language_servers.health_statuses {
@@ -767,7 +770,7 @@ impl LspButton {
                 });
                 servers_with_health_checks.insert(&health.name);
                 let worktree_name =
-                    worktree.map(|worktree| SharedString::new(worktree.read(cx).root_name()));
+                    worktree.map(|worktree| SharedString::new(worktree.read(cx).root_name_str()));
 
                 let binary_status = state.language_servers.binary_statuses.get(&health.name);
                 let server_data = ServerData::WithHealthCheck {
@@ -775,12 +778,11 @@ impl LspButton {
                     health,
                     binary_status,
                 };
-                match worktree_name {
-                    Some(worktree_name) => servers_per_worktree
+                if let Some(worktree_name) = worktree_name {
+                    servers_per_worktree
                         .entry(worktree_name.clone())
                         .or_default()
-                        .push(server_data),
-                    None => servers_without_worktree.push(server_data),
+                        .push(server_data);
                 }
             }
 
@@ -817,42 +819,25 @@ impl LspButton {
                     BinaryStatus::Failed { .. } => {}
                 }
 
-                match server_names_to_worktrees.get(server_name) {
-                    Some(worktrees_for_name) => {
-                        match worktrees_for_name
-                            .iter()
-                            .find(|(worktree, _)| active_worktrees.contains(worktree))
-                            .or_else(|| worktrees_for_name.iter().next())
-                        {
-                            Some((worktree, server_id)) => {
-                                let worktree_name =
-                                    SharedString::new(worktree.read(cx).root_name());
-                                servers_per_worktree
-                                    .entry(worktree_name.clone())
-                                    .or_default()
-                                    .push(ServerData::WithBinaryStatus {
-                                        server_name,
-                                        binary_status,
-                                        server_id: Some(*server_id),
-                                    });
-                            }
-                            None => servers_without_worktree.push(ServerData::WithBinaryStatus {
-                                server_name,
-                                binary_status,
-                                server_id: None,
-                            }),
-                        }
-                    }
-                    None => servers_without_worktree.push(ServerData::WithBinaryStatus {
-                        server_name,
-                        binary_status,
-                        server_id: None,
-                    }),
+                if let Some(worktrees_for_name) = server_names_to_worktrees.get(server_name)
+                    && let Some((worktree, server_id)) = worktrees_for_name
+                        .iter()
+                        .find(|(worktree, _)| active_worktrees.contains(worktree))
+                        .or_else(|| worktrees_for_name.iter().next())
+                {
+                    let worktree_name = SharedString::new(worktree.read(cx).root_name_str());
+                    servers_per_worktree
+                        .entry(worktree_name.clone())
+                        .or_default()
+                        .push(ServerData::WithBinaryStatus {
+                            server_name,
+                            binary_status,
+                            server_id: *server_id,
+                        });
                 }
             }
 
-            let mut new_lsp_items =
-                Vec::with_capacity(servers_per_worktree.len() + servers_without_worktree.len() + 2);
+            let mut new_lsp_items = Vec::with_capacity(servers_per_worktree.len() + 1);
             for (worktree_name, worktree_servers) in servers_per_worktree {
                 if worktree_servers.is_empty() {
                     continue;
@@ -862,17 +847,6 @@ impl LspButton {
                     separator: false,
                 });
                 new_lsp_items.extend(worktree_servers.into_iter().map(ServerData::into_lsp_item));
-            }
-            if !servers_without_worktree.is_empty() {
-                new_lsp_items.push(LspMenuItem::Header {
-                    header: Some(SharedString::from("Unknown worktree")),
-                    separator: false,
-                });
-                new_lsp_items.extend(
-                    servers_without_worktree
-                        .into_iter()
-                        .map(ServerData::into_lsp_item),
-                );
             }
             if !new_lsp_items.is_empty() {
                 if can_stop_all {
@@ -1006,7 +980,7 @@ impl StatusItemView for LspButton {
 impl Render for LspButton {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl ui::IntoElement {
         if self.server_state.read(cx).language_servers.is_empty() || self.lsp_menu.is_none() {
-            return div();
+            return div().hidden();
         }
 
         let mut has_errors = false;
@@ -1048,11 +1022,16 @@ impl Render for LspButton {
             (None, "All Servers Operational")
         };
 
-        let lsp_button = cx.entity();
+        let lsp_button = cx.weak_entity();
 
         div().child(
             PopoverMenu::new("lsp-tool")
-                .menu(move |_, cx| lsp_button.read(cx).lsp_menu.clone())
+                .menu(move |_, cx| {
+                    lsp_button
+                        .read_with(cx, |lsp_button, _| lsp_button.lsp_menu.clone())
+                        .ok()
+                        .flatten()
+                })
                 .anchor(Corner::BottomLeft)
                 .with_handle(self.popover_menu_handle.clone())
                 .trigger_with_tooltip(
@@ -1060,14 +1039,8 @@ impl Render for LspButton {
                         .when_some(indicator, IconButton::indicator)
                         .icon_size(IconSize::Small)
                         .indicator_border_color(Some(cx.theme().colors().status_bar_background)),
-                    move |window, cx| {
-                        Tooltip::with_meta(
-                            "Language Servers",
-                            Some(&ToggleMenu),
-                            description,
-                            window,
-                            cx,
-                        )
+                    move |_window, cx| {
+                        Tooltip::with_meta("Language Servers", Some(&ToggleMenu), description, cx)
                     },
                 ),
         )

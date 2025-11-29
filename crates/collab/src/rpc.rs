@@ -36,6 +36,7 @@ use reqwest_client::ReqwestClient;
 use rpc::proto::split_repository_update;
 use supermaven_api::{CreateExternalUserRequest, SupermavenAdminApi};
 use tracing::Span;
+use util::paths::PathStyle;
 
 use futures::{
     FutureExt, SinkExt, StreamExt, TryStreamExt, channel::oneshot, future::BoxFuture,
@@ -49,7 +50,7 @@ use rpc::{
         RequestMessage, ShareProject, UpdateChannelBufferCollaborators,
     },
 };
-use semantic_version::SemanticVersion;
+use semver::Version;
 use serde::{Serialize, Serializer};
 use std::{
     any::TypeId,
@@ -342,11 +343,12 @@ impl Server {
             .add_request_handler(forward_read_only_project_request::<proto::OpenBufferForSymbol>)
             .add_request_handler(forward_read_only_project_request::<proto::OpenBufferById>)
             .add_request_handler(forward_read_only_project_request::<proto::SynchronizeBuffers>)
-            .add_request_handler(forward_read_only_project_request::<proto::InlayHints>)
             .add_request_handler(forward_read_only_project_request::<proto::ResolveInlayHint>)
             .add_request_handler(forward_read_only_project_request::<proto::GetColorPresentation>)
             .add_request_handler(forward_read_only_project_request::<proto::OpenBufferByPath>)
+            .add_request_handler(forward_read_only_project_request::<proto::OpenImageByPath>)
             .add_request_handler(forward_read_only_project_request::<proto::GitGetBranches>)
+            .add_request_handler(forward_read_only_project_request::<proto::GetDefaultBranch>)
             .add_request_handler(forward_read_only_project_request::<proto::OpenUnstagedDiff>)
             .add_request_handler(forward_read_only_project_request::<proto::OpenUncommittedDiff>)
             .add_request_handler(forward_read_only_project_request::<proto::LspExtExpandMacro>)
@@ -394,6 +396,7 @@ impl Server {
             .add_request_handler(forward_mutating_project_request::<proto::StopLanguageServers>)
             .add_request_handler(forward_mutating_project_request::<proto::LinkedEditingRange>)
             .add_message_handler(create_buffer_for_peer)
+            .add_message_handler(create_image_for_peer)
             .add_request_handler(update_buffer)
             .add_message_handler(broadcast_project_message_from_host::<proto::RefreshInlayHints>)
             .add_message_handler(broadcast_project_message_from_host::<proto::RefreshCodeLens>)
@@ -450,6 +453,7 @@ impl Server {
             .add_request_handler(forward_mutating_project_request::<proto::StashPop>)
             .add_request_handler(forward_mutating_project_request::<proto::StashDrop>)
             .add_request_handler(forward_mutating_project_request::<proto::Commit>)
+            .add_request_handler(forward_mutating_project_request::<proto::RunGitHook>)
             .add_request_handler(forward_mutating_project_request::<proto::GitInit>)
             .add_request_handler(forward_read_only_project_request::<proto::GetRemotes>)
             .add_request_handler(forward_read_only_project_request::<proto::GitShow>)
@@ -461,6 +465,8 @@ impl Server {
             .add_message_handler(broadcast_project_message_from_host::<proto::BreakpointsForFile>)
             .add_request_handler(forward_mutating_project_request::<proto::OpenCommitMessageBuffer>)
             .add_request_handler(forward_mutating_project_request::<proto::GitDiff>)
+            .add_request_handler(forward_mutating_project_request::<proto::GetTreeDiff>)
+            .add_request_handler(forward_mutating_project_request::<proto::GetBlobContent>)
             .add_request_handler(forward_mutating_project_request::<proto::GitCreateBranch>)
             .add_request_handler(forward_mutating_project_request::<proto::GitChangeBranch>)
             .add_request_handler(forward_mutating_project_request::<proto::CheckForPushedCommits>)
@@ -979,14 +985,14 @@ impl Server {
 
                 {
                     let mut pool = self.connection_pool.lock();
-                    pool.add_connection(connection_id, user.id, user.admin, zed_version);
+                    pool.add_connection(connection_id, user.id, user.admin, zed_version.clone());
                     self.peer.send(
                         connection_id,
                         build_initial_contacts_update(contacts, &pool),
                     )?;
                 }
 
-                if should_auto_subscribe_to_channels(zed_version) {
+                if should_auto_subscribe_to_channels(&zed_version) {
                     subscribe_user_to_channels(user.id, session).await?;
                 }
 
@@ -1130,7 +1136,7 @@ impl Header for ProtocolVersion {
     }
 }
 
-pub struct AppVersionHeader(SemanticVersion);
+pub struct AppVersionHeader(Version);
 impl Header for AppVersionHeader {
     fn name() -> &'static HeaderName {
         static ZED_APP_VERSION: OnceLock<HeaderName> = OnceLock::new();
@@ -1879,6 +1885,7 @@ async fn share_project(
             session.connection_id,
             &request.worktrees,
             request.is_ssh_project,
+            request.windows_paths.unwrap_or(false),
         )
         .await?;
     response.send(proto::ShareProjectResponse {
@@ -2012,6 +2019,7 @@ async fn join_project(
         language_servers,
         language_server_capabilities,
         role: project.role.into(),
+        windows_paths: project.path_style == PathStyle::Windows,
     })?;
 
     for (worktree_id, worktree) in mem::take(&mut project.worktrees) {
@@ -2367,6 +2375,26 @@ async fn lsp_query(
 /// Notify other participants that a new buffer has been created
 async fn create_buffer_for_peer(
     request: proto::CreateBufferForPeer,
+    session: MessageContext,
+) -> Result<()> {
+    session
+        .db()
+        .await
+        .check_user_is_project_host(
+            ProjectId::from_proto(request.project_id),
+            session.connection_id,
+        )
+        .await?;
+    let peer_id = request.peer_id.context("invalid peer id")?;
+    session
+        .peer
+        .forward_send(session.connection_id, peer_id.into(), request)?;
+    Ok(())
+}
+
+/// Notify other participants that a new image has been created
+async fn create_image_for_peer(
+    request: proto::CreateImageForPeer,
     session: MessageContext,
 ) -> Result<()> {
     session
@@ -2806,8 +2834,8 @@ async fn remove_contact(
     Ok(())
 }
 
-fn should_auto_subscribe_to_channels(version: ZedVersion) -> bool {
-    version.0.minor() < 139
+fn should_auto_subscribe_to_channels(version: &ZedVersion) -> bool {
+    version.0.minor < 139
 }
 
 async fn subscribe_to_channels(

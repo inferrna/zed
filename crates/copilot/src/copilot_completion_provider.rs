@@ -3,7 +3,6 @@ use anyhow::Result;
 use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
 use gpui::{App, Context, Entity, EntityId, Task};
 use language::{Buffer, OffsetRangeExt, ToOffset, language_settings::AllLanguageSettings};
-use project::Project;
 use settings::Settings;
 use std::{path::Path, time::Duration};
 
@@ -69,7 +68,7 @@ impl EditPredictionProvider for CopilotCompletionProvider {
         false
     }
 
-    fn is_refreshing(&self) -> bool {
+    fn is_refreshing(&self, _cx: &App) -> bool {
         self.pending_refresh.is_some() && self.completions.is_empty()
     }
 
@@ -84,7 +83,6 @@ impl EditPredictionProvider for CopilotCompletionProvider {
 
     fn refresh(
         &mut self,
-        _project: Option<Entity<Project>>,
         buffer: Entity<Buffer>,
         cursor_position: language::Anchor,
         debounce: bool,
@@ -249,7 +247,7 @@ impl EditPredictionProvider for CopilotCompletionProvider {
                 None
             } else {
                 let position = cursor_position.bias_right(buffer);
-                Some(EditPrediction {
+                Some(EditPrediction::Local {
                     id: None,
                     edits: vec![(position..position, completion_text.into())],
                     edit_preview: None,
@@ -272,7 +270,7 @@ fn common_prefix<T1: Iterator<Item = char>, T2: Iterator<Item = char>>(a: T1, b:
 mod tests {
     use super::*;
     use editor::{
-        Editor, ExcerptRange, MultiBuffer, SelectionEffects,
+        Editor, ExcerptRange, MultiBuffer, MultiBufferOffset, SelectionEffects,
         test::editor_lsp_test_context::EditorLspTestContext,
     };
     use fs::FakeFs;
@@ -281,14 +279,11 @@ mod tests {
     use indoc::indoc;
     use language::{
         Point,
-        language_settings::{
-            AllLanguageSettings, AllLanguageSettingsContent, CompletionSettings, LspInsertMode,
-            WordsCompletionMode,
-        },
+        language_settings::{CompletionSettingsContent, LspInsertMode, WordsCompletionMode},
     };
     use project::Project;
     use serde_json::json;
-    use settings::SettingsStore;
+    use settings::{AllLanguageSettingsContent, SettingsStore};
     use std::future::Future;
     use util::{
         path,
@@ -299,12 +294,11 @@ mod tests {
     async fn test_copilot(executor: BackgroundExecutor, cx: &mut TestAppContext) {
         // flaky
         init_test(cx, |settings| {
-            settings.defaults.completions = Some(CompletionSettings {
-                words: WordsCompletionMode::Disabled,
-                words_min_length: 0,
-                lsp: true,
-                lsp_fetch_timeout_ms: 0,
-                lsp_insert_mode: LspInsertMode::Insert,
+            settings.defaults.completions = Some(CompletionSettingsContent {
+                words: Some(WordsCompletionMode::Disabled),
+                words_min_length: Some(0),
+                lsp_insert_mode: Some(LspInsertMode::Insert),
+                ..Default::default()
             });
         });
 
@@ -532,12 +526,11 @@ mod tests {
     ) {
         // flaky
         init_test(cx, |settings| {
-            settings.defaults.completions = Some(CompletionSettings {
-                words: WordsCompletionMode::Disabled,
-                words_min_length: 0,
-                lsp: true,
-                lsp_fetch_timeout_ms: 0,
-                lsp_insert_mode: LspInsertMode::Insert,
+            settings.defaults.completions = Some(CompletionSettingsContent {
+                words: Some(WordsCompletionMode::Disabled),
+                words_min_length: Some(0),
+                lsp_insert_mode: Some(LspInsertMode::Insert),
+                ..Default::default()
             });
         });
 
@@ -1088,8 +1081,9 @@ mod tests {
             vec![complete_from_marker, replace_range_marker.clone()],
         );
 
+        let range = marked_ranges.remove(&replace_range_marker).unwrap()[0].clone();
         let replace_range =
-            cx.to_lsp_range(marked_ranges.remove(&replace_range_marker).unwrap()[0].clone());
+            cx.to_lsp_range(MultiBufferOffset(range.start)..MultiBufferOffset(range.end));
 
         let mut request =
             cx.set_request_handler::<lsp::request::Completion, _, _>(move |url, params, _| {
@@ -1122,13 +1116,8 @@ mod tests {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
             theme::init(theme::LoadThemes::JustBase, cx);
-            client::init_settings(cx);
-            language::init(cx);
-            editor::init_settings(cx);
-            Project::init_settings(cx);
-            workspace::init_settings(cx);
             SettingsStore::update_global(cx, |store: &mut SettingsStore, cx| {
-                store.update_user_settings::<AllLanguageSettings>(cx, f);
+                store.update_user_settings(cx, |settings| f(&mut settings.project.all_languages));
             });
         });
     }

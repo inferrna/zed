@@ -18,11 +18,12 @@ use head::Head;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{ops::Range, sync::Arc, time::Duration};
+use theme::ThemeSettings;
 use ui::{
-    Color, Divider, Label, ListItem, ListItemSpacing, ScrollAxes, Scrollbars, WithScrollbar,
-    prelude::*, v_flex,
+    Color, Divider, DocumentationAside, DocumentationEdge, DocumentationSide, Label, ListItem,
+    ListItemSpacing, ScrollAxes, Scrollbars, WithScrollbar, prelude::*, utils::WithRemSize, v_flex,
 };
-use workspace::ModalView;
+use workspace::{ModalView, item::Settings};
 
 enum ElementContainer {
     List(ListState),
@@ -222,6 +223,14 @@ pub trait PickerDelegate: Sized + 'static {
     ) -> Option<AnyElement> {
         None
     }
+
+    fn documentation_aside(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<DocumentationAside> {
+        None
+    }
 }
 
 impl<D: PickerDelegate> Focusable for Picker<D> {
@@ -269,6 +278,15 @@ impl<D: PickerDelegate> Picker<D> {
     /// A picker, which displays its matches using `gpui::list`, matches can have different heights.
     /// The picker allows the user to perform search items by text.
     /// If `PickerDelegate::render_match` only returns items with the same height, use `Picker::uniform_list` as its implementation is optimized for that.
+    pub fn nonsearchable_list(delegate: D, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let head = Head::empty(Self::on_empty_head_blur, window, cx);
+
+        Self::new(delegate, ContainerKind::List, head, window, cx)
+    }
+
+    /// A picker, which displays its matches using `gpui::list`, matches can have different heights.
+    /// The picker allows the user to perform search items by text.
+    /// If `PickerDelegate::render_match` only returns items with the same height, use `Picker::uniform_list` as its implementation is optimized for that.
     pub fn list(delegate: D, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let head = Head::editor(
             delegate.placeholder_text(window, cx),
@@ -296,7 +314,7 @@ impl<D: PickerDelegate> Picker<D> {
             confirm_on_update: None,
             width: None,
             widest_item: None,
-            max_height: Some(rems(18.).into()),
+            max_height: Some(rems(24.).into()),
             show_scrollbar: false,
             is_modal: true,
         };
@@ -340,6 +358,16 @@ impl<D: PickerDelegate> Picker<D> {
 
     pub fn modal(mut self, modal: bool) -> Self {
         self.is_modal = modal;
+        self
+    }
+
+    pub fn list_measure_all(mut self) -> Self {
+        match self.element_container {
+            ElementContainer::List(state) => {
+                self.element_container = ElementContainer::List(state.measure_all());
+            }
+            _ => {}
+        }
         self
     }
 
@@ -579,7 +607,7 @@ impl<D: PickerDelegate> Picker<D> {
                 self.update_matches(query, window, cx);
             }
             editor::EditorEvent::Blurred => {
-                if self.is_modal {
+                if self.is_modal && window.is_window_active() {
                     self.cancel(&menu::Cancel, window, cx);
                 }
             }
@@ -591,7 +619,9 @@ impl<D: PickerDelegate> Picker<D> {
         let Head::Empty(_) = &self.head else {
             panic!("unexpected call");
         };
-        self.cancel(&menu::Cancel, window, cx);
+        if window.is_window_active() {
+            self.cancel(&menu::Cancel, window, cx);
+        }
     }
 
     pub fn refresh_placeholder(&mut self, window: &mut Window, cx: &mut App) {
@@ -681,7 +711,7 @@ impl<D: PickerDelegate> Picker<D> {
         match &mut self.element_container {
             ElementContainer::List(state) => state.scroll_to_reveal_item(ix),
             ElementContainer::UniformList(scroll_handle) => {
-                scroll_handle.scroll_to_item(ix, ScrollStrategy::Top)
+                scroll_handle.scroll_to_item(ix, ScrollStrategy::Nearest)
             }
         }
     }
@@ -750,7 +780,7 @@ impl<D: PickerDelegate> Picker<D> {
             })
             .flex_grow()
             .py_1()
-            .track_scroll(scroll_handle.clone())
+            .track_scroll(&scroll_handle)
             .into_any_element(),
             ElementContainer::List(state) => list(
                 state.clone(),
@@ -781,8 +811,15 @@ impl<D: PickerDelegate> ModalView for Picker<D> {}
 
 impl<D: PickerDelegate> Render for Picker<D> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui_font_size = ThemeSettings::get_global(cx).ui_font_size(cx);
+        let window_size = window.viewport_size();
+        let rem_size = window.rem_size();
+        let is_wide_window = window_size.width / rem_size > rems_from_px(800.).0;
+
+        let aside = self.delegate.documentation_aside(window, cx);
+
         let editor_position = self.delegate.editor_position();
-        v_flex()
+        let menu = v_flex()
             .key_context("Picker")
             .size_full()
             .when_some(self.width, |el, width| el.w(width))
@@ -829,12 +866,12 @@ impl<D: PickerDelegate> Render for Picker<D> {
 
                             this.map(|this| match &self.element_container {
                                 ElementContainer::List(state) => this.custom_scrollbars(
-                                    base_scrollbar_config.tracked_scroll_handle(state.clone()),
+                                    base_scrollbar_config.tracked_scroll_handle(state),
                                     window,
                                     cx,
                                 ),
                                 ElementContainer::UniformList(state) => this.custom_scrollbars(
-                                    base_scrollbar_config.tracked_scroll_handle(state.clone()),
+                                    base_scrollbar_config.tracked_scroll_handle(state),
                                     window,
                                     cx,
                                 ),
@@ -865,6 +902,47 @@ impl<D: PickerDelegate> Render for Picker<D> {
                     }
                 }
                 Head::Empty(empty_head) => Some(div().child(empty_head.clone())),
-            })
+            });
+
+        let Some(aside) = aside else {
+            return menu;
+        };
+
+        let render_aside = |aside: DocumentationAside, cx: &mut Context<Self>| {
+            WithRemSize::new(ui_font_size)
+                .occlude()
+                .elevation_2(cx)
+                .w_full()
+                .p_2()
+                .overflow_hidden()
+                .when(is_wide_window, |this| this.max_w_96())
+                .when(!is_wide_window, |this| this.max_w_48())
+                .child((aside.render)(cx))
+        };
+
+        if is_wide_window {
+            div().relative().child(menu).child(
+                h_flex()
+                    .absolute()
+                    .when(aside.side == DocumentationSide::Left, |this| {
+                        this.right_full().mr_1()
+                    })
+                    .when(aside.side == DocumentationSide::Right, |this| {
+                        this.left_full().ml_1()
+                    })
+                    .when(aside.edge == DocumentationEdge::Top, |this| this.top_0())
+                    .when(aside.edge == DocumentationEdge::Bottom, |this| {
+                        this.bottom_0()
+                    })
+                    .child(render_aside(aside, cx)),
+            )
+        } else {
+            v_flex()
+                .w_full()
+                .gap_1()
+                .justify_end()
+                .child(render_aside(aside, cx))
+                .child(menu)
+        }
     }
 }

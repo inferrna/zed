@@ -3,10 +3,13 @@ use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::B
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest, http};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+pub use settings::DataCollection;
+pub use settings::ModelMode;
+pub use settings::OpenRouterAvailableModel as AvailableModel;
+pub use settings::OpenRouterProvider as Provider;
 use std::{convert::TryFrom, io, time::Duration};
 use strum::EnumString;
 use thiserror::Error;
-use util::serde::default_true;
 
 pub const OPEN_ROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
 
@@ -66,41 +69,6 @@ impl From<Role> for String {
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DataCollection {
-    Allow,
-    Disallow,
-}
-
-impl Default for DataCollection {
-    fn default() -> Self {
-        Self::Allow
-    }
-}
-
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Provider {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    order: Option<Vec<String>>,
-    #[serde(default = "default_true")]
-    allow_fallbacks: bool,
-    #[serde(default)]
-    require_parameters: bool,
-    #[serde(default)]
-    data_collection: DataCollection,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    only: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ignore: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    quantizations: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sort: Option<String>,
-}
-
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Model {
     pub name: String,
@@ -111,16 +79,6 @@ pub struct Model {
     #[serde(default)]
     pub mode: ModelMode,
     pub provider: Option<Provider>,
-}
-
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub enum ModelMode {
-    #[default]
-    Default,
-    Thinking {
-        budget_tokens: Option<u32>,
-    },
 }
 
 impl Model {
@@ -257,6 +215,8 @@ pub enum RequestMessage {
         content: Option<MessageContent>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_details: Option<serde_json::Value>,
     },
     User {
         content: MessageContent,
@@ -383,6 +343,8 @@ pub enum ToolCallContent {
 pub struct FunctionContent {
     pub name: String,
     pub arguments: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -392,6 +354,8 @@ pub struct ResponseMessageDelta {
     pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "is_none_or_empty")]
     pub tool_calls: Option<Vec<ToolCallChunk>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -405,6 +369,8 @@ pub struct ToolCallChunk {
 pub struct FunctionChunk {
     pub name: Option<String>,
     pub arguments: Option<String>,
+    #[serde(default)]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

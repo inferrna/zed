@@ -6,12 +6,7 @@ use itertools::Itertools;
 use language::{
     Anchor, Buffer, Capability, LanguageRegistry, OffsetRangeExt as _, Point, Rope, TextBuffer,
 };
-use std::{
-    cmp::Reverse,
-    ops::Range,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{cmp::Reverse, ops::Range, path::Path, sync::Arc};
 use util::ResultExt;
 
 pub enum Diff {
@@ -21,7 +16,7 @@ pub enum Diff {
 
 impl Diff {
     pub fn finalized(
-        path: PathBuf,
+        path: String,
         old_text: Option<String>,
         new_text: String,
         language_registry: Arc<LanguageRegistry>,
@@ -36,7 +31,7 @@ impl Diff {
             let buffer = new_buffer.clone();
             async move |_, cx| {
                 let language = language_registry
-                    .language_for_file_path(&path)
+                    .load_language_for_file_path(Path::new(&path))
                     .await
                     .log_err();
 
@@ -55,9 +50,14 @@ impl Diff {
                         let hunk_ranges = {
                             let buffer = buffer.read(cx);
                             let diff = diff.read(cx);
-                            diff.hunks_intersecting_range(Anchor::MIN..Anchor::MAX, buffer, cx)
-                                .map(|diff_hunk| diff_hunk.buffer_range.to_point(buffer))
-                                .collect::<Vec<_>>()
+                            diff.hunks_intersecting_range(
+                                Anchor::min_for_buffer(buffer.remote_id())
+                                    ..Anchor::max_for_buffer(buffer.remote_id()),
+                                buffer,
+                                cx,
+                            )
+                            .map(|diff_hunk| diff_hunk.buffer_range.to_point(buffer))
+                            .collect::<Vec<_>>()
                         };
 
                         multibuffer.set_excerpts_for_path(
@@ -152,12 +152,15 @@ impl Diff {
         let path = match self {
             Diff::Pending(PendingDiff {
                 new_buffer: buffer, ..
-            }) => buffer.read(cx).file().map(|file| file.path().as_ref()),
-            Diff::Finalized(FinalizedDiff { path, .. }) => Some(path.as_path()),
+            }) => buffer
+                .read(cx)
+                .file()
+                .map(|file| file.path().display(file.path_style(cx))),
+            Diff::Finalized(FinalizedDiff { path, .. }) => Some(path.as_str().into()),
         };
         format!(
             "Diff: {}\n```\n{}\n```\n",
-            path.unwrap_or(Path::new("untitled")).display(),
+            path.unwrap_or("untitled".into()),
             buffer_text
         )
     }
@@ -238,21 +241,21 @@ impl PendingDiff {
     fn finalize(&self, cx: &mut Context<Diff>) -> FinalizedDiff {
         let ranges = self.excerpt_ranges(cx);
         let base_text = self.base_text.clone();
-        let language_registry = self.new_buffer.read(cx).language_registry();
+        let new_buffer = self.new_buffer.read(cx);
+        let language_registry = new_buffer.language_registry();
 
-        let path = self
-            .new_buffer
-            .read(cx)
+        let path = new_buffer
             .file()
-            .map(|file| file.path().as_ref())
-            .unwrap_or(Path::new("untitled"))
+            .map(|file| file.path().display(file.path_style(cx)))
+            .unwrap_or("untitled".into())
             .into();
+        let replica_id = new_buffer.replica_id();
 
         // Replace the buffer in the multibuffer with the snapshot
         let buffer = cx.new(|cx| {
             let language = self.new_buffer.read(cx).language().cloned();
             let buffer = TextBuffer::new_normalized(
-                0,
+                replica_id,
                 cx.entity_id().as_non_zero_u64().into(),
                 self.new_buffer.read(cx).line_ending(),
                 self.new_buffer.read(cx).as_rope().clone(),
@@ -318,7 +321,12 @@ impl PendingDiff {
         let buffer = self.new_buffer.read(cx);
         let diff = self.diff.read(cx);
         let mut ranges = diff
-            .hunks_intersecting_range(Anchor::MIN..Anchor::MAX, buffer, cx)
+            .hunks_intersecting_range(
+                Anchor::min_for_buffer(buffer.remote_id())
+                    ..Anchor::max_for_buffer(buffer.remote_id()),
+                buffer,
+                cx,
+            )
             .map(|diff_hunk| diff_hunk.buffer_range.to_point(buffer))
             .collect::<Vec<_>>();
         ranges.extend(
@@ -348,7 +356,7 @@ impl PendingDiff {
 }
 
 pub struct FinalizedDiff {
-    path: PathBuf,
+    path: String,
     base_text: Arc<String>,
     new_buffer: Entity<Buffer>,
     multibuffer: Entity<MultiBuffer>,

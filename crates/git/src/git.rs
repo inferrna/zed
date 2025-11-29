@@ -11,22 +11,18 @@ pub use crate::remote::*;
 use anyhow::{Context as _, Result};
 pub use git2 as libgit;
 use gpui::{Action, actions};
-pub use repository::WORK_DIRECTORY_REPO_PATH;
+pub use repository::RemoteCommandOutput;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::ffi::OsStr;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::LazyLock;
 
-pub static DOT_GIT: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new(".git"));
-pub static GITIGNORE: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new(".gitignore"));
-pub static FSMONITOR_DAEMON: LazyLock<&'static OsStr> =
-    LazyLock::new(|| OsStr::new("fsmonitor--daemon"));
-pub static LFS_DIR: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new("lfs"));
-pub static COMMIT_MESSAGE: LazyLock<&'static OsStr> =
-    LazyLock::new(|| OsStr::new("COMMIT_EDITMSG"));
-pub static INDEX_LOCK: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new("index.lock"));
+pub const DOT_GIT: &str = ".git";
+pub const GITIGNORE: &str = ".gitignore";
+pub const FSMONITOR_DAEMON: &str = "fsmonitor--daemon";
+pub const LFS_DIR: &str = "lfs";
+pub const COMMIT_MESSAGE: &str = "COMMIT_EDITMSG";
+pub const INDEX_LOCK: &str = "index.lock";
 
 actions!(
     git,
@@ -76,6 +72,8 @@ actions!(
         ForcePush,
         /// Pulls changes from the remote repository.
         Pull,
+        /// Pulls changes from the remote repository with rebase.
+        PullRebase,
         /// Fetches changes from the remote repository.
         Fetch,
         /// Fetches changes from a specific remote.
@@ -98,8 +96,22 @@ actions!(
         OpenModifiedFiles,
         /// Clones a repository.
         Clone,
+        /// Adds a file to .gitignore.
+        AddToGitignore,
     ]
 );
+
+/// Renames a git branch.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct RenameBranch {
+    /// The branch to rename.
+    ///
+    /// Default: the current branch.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
 
 /// Restores a file to its last committed state, discarding local changes.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
@@ -211,5 +223,30 @@ impl From<Oid> for usize {
         u64_bytes.copy_from_slice(&bytes[..8]);
 
         u64::from_ne_bytes(u64_bytes) as usize
+    }
+}
+
+#[repr(i32)]
+#[derive(Copy, Clone, Debug)]
+pub enum RunHook {
+    PreCommit,
+}
+
+impl RunHook {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::PreCommit => "pre-commit",
+        }
+    }
+
+    pub fn to_proto(&self) -> i32 {
+        *self as i32
+    }
+
+    pub fn from_proto(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::PreCommit),
+            _ => None,
+        }
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use gpui::{Context, Entity, Window};
-use multi_buffer::{MultiBuffer, ToOffset};
+use multi_buffer::{BufferOffset, MultiBuffer, ToOffset};
 use std::ops::Range;
 use util::ResultExt as _;
 
@@ -328,7 +328,7 @@ pub(crate) fn refresh_enabled_in_any_buffer(
                     snapshot.file(),
                     cx,
                 );
-                if language_settings.jsx_tag_auto_close.enabled {
+                if language_settings.jsx_tag_auto_close {
                     found_enabled = true;
                 }
             }
@@ -406,7 +406,7 @@ pub(crate) fn handle_from(
             };
 
             let language_settings = snapshot.settings_at(edit.new.end, cx);
-            if !language_settings.jsx_tag_auto_close.enabled {
+            if !language_settings.jsx_tag_auto_close {
                 continue;
             }
 
@@ -507,7 +507,7 @@ pub(crate) fn handle_from(
 
             {
                 let selections = this
-                    .read_with(cx, |this, _| this.selections.disjoint_anchors())
+                    .read_with(cx, |this, _| this.selections.disjoint_anchors_arc())
                     .ok()?;
                 for selection in selections.iter() {
                     let Some(selection_buffer_offset_head) =
@@ -546,9 +546,10 @@ pub(crate) fn handle_from(
                 if edit_range_offset.start != edit_range_offset.end {
                     continue;
                 }
-                if let Some(selection) =
-                    buffer_selection_map.get_mut(&(edit_range_offset.start, edit_range_offset.end))
-                {
+                if let Some(selection) = buffer_selection_map.get_mut(&(
+                    BufferOffset(edit_range_offset.start),
+                    BufferOffset(edit_range_offset.end),
+                )) {
                     if selection.0.head().bias() != text::Bias::Right
                         || selection.0.tail().bias() != text::Bias::Right
                     {
@@ -620,14 +621,17 @@ mod jsx_tag_autoclose_tests {
 
     use super::*;
     use gpui::{AppContext as _, TestAppContext};
-    use language::language_settings::JsxTagAutoCloseSettings;
     use languages::language;
-    use multi_buffer::ExcerptRange;
+    use multi_buffer::{ExcerptRange, MultiBufferOffset};
     use text::Selection;
 
     async fn test_setup(cx: &mut TestAppContext) -> EditorTestContext {
         init_test(cx, |settings| {
-            settings.defaults.jsx_tag_auto_close = Some(JsxTagAutoCloseSettings { enabled: true });
+            settings
+                .defaults
+                .jsx_tag_auto_close
+                .get_or_insert_default()
+                .enabled = Some(true);
         });
 
         let mut cx = EditorTestContext::new(cx).await;
@@ -789,7 +793,11 @@ mod jsx_tag_autoclose_tests {
     #[gpui::test]
     async fn test_multibuffer(cx: &mut TestAppContext) {
         init_test(cx, |settings| {
-            settings.defaults.jsx_tag_auto_close = Some(JsxTagAutoCloseSettings { enabled: true });
+            settings
+                .defaults
+                .jsx_tag_auto_close
+                .get_or_insert_default()
+                .enabled = Some(true);
         });
 
         let buffer_a = cx.new(|cx| {
@@ -835,9 +843,9 @@ mod jsx_tag_autoclose_tests {
         cx.update_editor(|editor, window, cx| {
             editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
                 selections.select(vec![
-                    Selection::from_offset(4),
-                    Selection::from_offset(9),
-                    Selection::from_offset(15),
+                    Selection::from_offset(MultiBufferOffset(4)),
+                    Selection::from_offset(MultiBufferOffset(9)),
+                    Selection::from_offset(MultiBufferOffset(15)),
                 ])
             })
         });

@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use fs::Fs;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use futures::{Stream, TryFutureExt, stream};
-use gpui::{AnyView, App, AsyncApp, Context, Task};
+use gpui::{AnyView, App, AsyncApp, Context, CursorStyle, Entity, Task};
 use http_client::HttpClient;
 use language_model::{
     AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
@@ -13,24 +13,22 @@ use language_model::{
 };
 use menu;
 use ollama::{
-    ChatMessage, ChatOptions, ChatRequest, ChatResponseDelta, KeepAlive, OLLAMA_API_URL,
-    OllamaFunctionCall, OllamaFunctionTool, OllamaToolCall, get_models, show_model,
-    stream_chat_completion,
+    ChatMessage, ChatOptions, ChatRequest, ChatResponseDelta, OLLAMA_API_URL, OllamaFunctionCall,
+    OllamaFunctionTool, OllamaToolCall, get_models, show_model, stream_chat_completion,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+pub use settings::OllamaAvailableModel as AvailableModel;
 use settings::{Settings, SettingsStore, update_settings_file};
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, sync::Arc};
 use ui::{ButtonLike, ElevationIndex, List, Tooltip, prelude::*};
-use ui_input::SingleLineInput;
+use ui_input::InputField;
 use zed_env_vars::{EnvVar, env_var};
 
 use crate::AllLanguageModelSettings;
 use crate::api_key::ApiKeyState;
-use crate::ui::InstructionListItem;
+use crate::ui::{ConfiguredApiCard, InstructionListItem};
 
 const OLLAMA_DOWNLOAD_URL: &str = "https://ollama.com/download";
 const OLLAMA_LIBRARY_URL: &str = "https://ollama.com/library";
@@ -48,27 +46,9 @@ pub struct OllamaSettings {
     pub available_models: Vec<AvailableModel>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct AvailableModel {
-    /// The model name in the Ollama API (e.g. "llama3.2:latest")
-    pub name: String,
-    /// The model's name in Zed's UI, such as in the model selector dropdown menu in the assistant panel.
-    pub display_name: Option<String>,
-    /// The Context Length parameter to the model (aka num_ctx or n_ctx)
-    pub max_tokens: u64,
-    /// The number of seconds to keep the connection open after the last request
-    pub keep_alive: Option<KeepAlive>,
-    /// Whether the model supports tools
-    pub supports_tools: Option<bool>,
-    /// Whether the model supports vision
-    pub supports_images: Option<bool>,
-    /// Whether to enable think mode
-    pub supports_thinking: Option<bool>,
-}
-
 pub struct OllamaLanguageModelProvider {
     http_client: Arc<dyn HttpClient>,
-    state: gpui::Entity<State>,
+    state: Entity<State>,
 }
 
 pub struct State {
@@ -125,8 +105,7 @@ impl State {
 
         // As a proxy for the server being "authenticated", we'll check if its up by fetching the models
         cx.spawn(async move |this, cx| {
-            let models =
-                get_models(http_client.as_ref(), &api_url, api_key.as_deref(), None).await?;
+            let models = get_models(http_client.as_ref(), &api_url, api_key.as_deref()).await?;
 
             let tasks = models
                 .into_iter()
@@ -140,16 +119,16 @@ impl State {
                     let api_key = api_key.clone();
                     async move {
                         let name = model.name.as_str();
-                        let capabilities =
+                        let model =
                             show_model(http_client.as_ref(), &api_url, api_key.as_deref(), name)
                                 .await?;
                         let ollama_model = ollama::Model::new(
                             name,
                             None,
-                            None,
-                            Some(capabilities.supports_tools()),
-                            Some(capabilities.supports_vision()),
-                            Some(capabilities.supports_thinking()),
+                            model.context_length,
+                            Some(model.supports_tools()),
+                            Some(model.supports_vision()),
+                            Some(model.supports_thinking()),
                         );
                         Ok(ollama_model)
                     }
@@ -230,7 +209,7 @@ impl OllamaLanguageModelProvider {
 impl LanguageModelProviderState for OllamaLanguageModelProvider {
     type ObservableEntity = State;
 
-    fn observable_entity(&self) -> Option<gpui::Entity<Self::ObservableEntity>> {
+    fn observable_entity(&self) -> Option<Entity<Self::ObservableEntity>> {
         Some(self.state.clone())
     }
 }
@@ -269,19 +248,32 @@ impl LanguageModelProvider for OllamaLanguageModelProvider {
         }
 
         // Override with available models from settings
-        for model in &OllamaLanguageModelProvider::settings(cx).available_models {
-            models.insert(
-                model.name.clone(),
-                ollama::Model {
-                    name: model.name.clone(),
-                    display_name: model.display_name.clone(),
-                    max_tokens: model.max_tokens,
-                    keep_alive: model.keep_alive.clone(),
-                    supports_tools: model.supports_tools,
-                    supports_vision: model.supports_images,
-                    supports_thinking: model.supports_thinking,
-                },
-            );
+        for setting_model in &OllamaLanguageModelProvider::settings(cx).available_models {
+            let setting_base = setting_model.name.split(':').next().unwrap();
+            if let Some(model) = models
+                .values_mut()
+                .find(|m| m.name.split(':').next().unwrap() == setting_base)
+            {
+                model.max_tokens = setting_model.max_tokens;
+                model.display_name = setting_model.display_name.clone();
+                model.keep_alive = setting_model.keep_alive.clone();
+                model.supports_tools = setting_model.supports_tools;
+                model.supports_vision = setting_model.supports_images;
+                model.supports_thinking = setting_model.supports_thinking;
+            } else {
+                models.insert(
+                    setting_model.name.clone(),
+                    ollama::Model {
+                        name: setting_model.name.clone(),
+                        display_name: setting_model.display_name.clone(),
+                        max_tokens: setting_model.max_tokens,
+                        keep_alive: setting_model.keep_alive.clone(),
+                        supports_tools: setting_model.supports_tools,
+                        supports_vision: setting_model.supports_images,
+                        supports_thinking: setting_model.supports_thinking,
+                    },
+                );
+            }
         }
 
         let mut models = models
@@ -330,7 +322,7 @@ pub struct OllamaLanguageModel {
     model: ollama::Model,
     http_client: Arc<dyn HttpClient>,
     request_limiter: RateLimiter,
-    state: gpui::Entity<State>,
+    state: Entity<State>,
 }
 
 impl OllamaLanguageModel {
@@ -389,10 +381,13 @@ impl OllamaLanguageModel {
                                 thinking = Some(text)
                             }
                             MessageContent::ToolUse(tool_use) => {
-                                tool_calls.push(OllamaToolCall::Function(OllamaFunctionCall {
-                                    name: tool_use.name.to_string(),
-                                    arguments: tool_use.input,
-                                }));
+                                tool_calls.push(OllamaToolCall {
+                                    id: Some(tool_use.id.to_string()),
+                                    function: OllamaFunctionCall {
+                                        name: tool_use.name.to_string(),
+                                        arguments: tool_use.input,
+                                    },
+                                });
                             }
                             _ => (),
                         }
@@ -583,25 +578,24 @@ fn map_to_language_model_completion_events(
                     }
 
                     if let Some(tool_call) = tool_calls.and_then(|v| v.into_iter().next()) {
-                        match tool_call {
-                            OllamaToolCall::Function(function) => {
-                                let tool_id = format!(
-                                    "{}-{}",
-                                    &function.name,
-                                    TOOL_CALL_COUNTER.fetch_add(1, Ordering::Relaxed)
-                                );
-                                let event =
-                                    LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
-                                        id: LanguageModelToolUseId::from(tool_id),
-                                        name: Arc::from(function.name),
-                                        raw_input: function.arguments.to_string(),
-                                        input: function.arguments,
-                                        is_input_complete: true,
-                                    });
-                                events.push(Ok(event));
-                                state.used_tools = true;
-                            }
-                        }
+                        let OllamaToolCall { id, function } = tool_call;
+                        let id = id.unwrap_or_else(|| {
+                            format!(
+                                "{}-{}",
+                                &function.name,
+                                TOOL_CALL_COUNTER.fetch_add(1, Ordering::Relaxed)
+                            )
+                        });
+                        let event = LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                            id: LanguageModelToolUseId::from(id),
+                            name: Arc::from(function.name),
+                            raw_input: function.arguments.to_string(),
+                            input: function.arguments,
+                            is_input_complete: true,
+                            thought_signature: None,
+                        });
+                        events.push(Ok(event));
+                        state.used_tools = true;
                     } else if !content.is_empty() {
                         events.push(Ok(LanguageModelCompletionEvent::Text(content)));
                     }
@@ -631,18 +625,17 @@ fn map_to_language_model_completion_events(
 }
 
 struct ConfigurationView {
-    api_key_editor: gpui::Entity<SingleLineInput>,
-    api_url_editor: gpui::Entity<SingleLineInput>,
-    state: gpui::Entity<State>,
+    api_key_editor: Entity<InputField>,
+    api_url_editor: Entity<InputField>,
+    state: Entity<State>,
 }
 
 impl ConfigurationView {
-    pub fn new(state: gpui::Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let api_key_editor =
-            cx.new(|cx| SingleLineInput::new(window, cx, "63e02e...").label("API key"));
+    pub fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let api_key_editor = cx.new(|cx| InputField::new(window, cx, "63e02e...").label("API key"));
 
         let api_url_editor = cx.new(|cx| {
-            let input = SingleLineInput::new(window, cx, OLLAMA_API_URL).label("API URL");
+            let input = InputField::new(window, cx, OLLAMA_API_URL).label("API URL");
             input.set_text(OllamaLanguageModelProvider::api_url(cx), window, cx);
             input
         });
@@ -703,15 +696,13 @@ impl ConfigurationView {
         let current_url = OllamaLanguageModelProvider::api_url(cx);
         if !api_url.is_empty() && &api_url != &current_url {
             let fs = <dyn Fs>::global(cx);
-            update_settings_file::<AllLanguageModelSettings>(fs, cx, move |settings, _| {
-                if let Some(settings) = settings.ollama.as_mut() {
-                    settings.api_url = Some(api_url);
-                } else {
-                    settings.ollama = Some(crate::settings::OllamaSettingsContent {
-                        api_url: Some(api_url),
-                        available_models: None,
-                    });
-                }
+            update_settings_file(fs, cx, move |settings, _| {
+                settings
+                    .language_models
+                    .get_or_insert_default()
+                    .ollama
+                    .get_or_insert_default()
+                    .api_url = Some(api_url);
             });
         }
     }
@@ -720,8 +711,12 @@ impl ConfigurationView {
         self.api_url_editor
             .update(cx, |input, cx| input.set_text("", window, cx));
         let fs = <dyn Fs>::global(cx);
-        update_settings_file::<AllLanguageModelSettings>(fs, cx, |settings, _cx| {
-            if let Some(settings) = settings.ollama.as_mut() {
+        update_settings_file(fs, cx, |settings, _cx| {
+            if let Some(settings) = settings
+                .language_models
+                .as_mut()
+                .and_then(|models| models.ollama.as_mut())
+            {
                 settings.api_url = Some(OLLAMA_API_URL.into());
             }
         });
@@ -756,9 +751,14 @@ impl ConfigurationView {
             ))
     }
 
-    fn render_api_key_editor(&self, cx: &Context<Self>) -> Div {
+    fn render_api_key_editor(&self, cx: &Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let env_var_set = state.api_key_state.is_from_env_var();
+        let configured_card_label = if env_var_set {
+            format!("API key set in {API_KEY_ENV_VAR_NAME} environment variable.")
+        } else {
+            "API key configured".to_string()
+        };
 
         if !state.api_key_state.has_key() {
             v_flex()
@@ -771,40 +771,15 @@ impl ConfigurationView {
                   .size(LabelSize::Small)
                   .color(Color::Muted),
               )
+              .into_any_element()
         } else {
-            h_flex()
-                .p_3()
-                .justify_between()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .bg(cx.theme().colors().elevated_surface_background)
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(Icon::new(IconName::Check).color(Color::Success))
-                        .child(
-                            Label::new(
-                                if env_var_set {
-                                    format!("API key set in {API_KEY_ENV_VAR_NAME} environment variable.")
-                                } else {
-                                    "API key configured".to_string()
-                                }
-                            )
-                        )
-                )
-                .child(
-                    Button::new("reset-api-key", "Reset API Key")
-                        .label_size(LabelSize::Small)
-                        .icon(IconName::Undo)
-                        .icon_size(IconSize::Small)
-                        .icon_position(IconPosition::Start)
-                        .layer(ElevationIndex::ModalSurface)
-                        .when(env_var_set, |this| {
-                            this.tooltip(Tooltip::text(format!("To reset your API key, unset the {API_KEY_ENV_VAR_NAME} environment variable.")))
-                        })
-                        .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx))),
-                )
+            ConfiguredApiCard::new(configured_card_label)
+                .disabled(env_var_set)
+                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx)))
+                .when(env_var_set, |this| {
+                    this.tooltip_label(format!("To reset your API key, unset the {API_KEY_ENV_VAR_NAME} environment variable."))
+                })
+                .into_any_element()
         }
     }
 
@@ -906,13 +881,23 @@ impl Render for ConfigurationView {
                             this.child(
                                 ButtonLike::new("connected")
                                     .disabled(true)
-                                    .cursor_style(gpui::CursorStyle::Arrow)
+                                    .cursor_style(CursorStyle::Arrow)
                                     .child(
                                         h_flex()
                                             .gap_2()
                                             .child(Icon::new(IconName::Check).color(Color::Success))
                                             .child(Label::new("Connected"))
                                             .into_any_element(),
+                                    )
+                                    .child(
+                                        IconButton::new("refresh-models", IconName::RotateCcw)
+                                            .tooltip(Tooltip::text("Refresh Models"))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.update(cx, |state, _| {
+                                                    state.fetched_models.clear();
+                                                });
+                                                this.retry_connection(cx);
+                                            })),
                                     ),
                             )
                         } else {

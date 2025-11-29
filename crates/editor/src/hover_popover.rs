@@ -1,8 +1,9 @@
 use crate::{
     ActiveDiagnostic, Anchor, AnchorRangeExt, DisplayPoint, DisplayRow, Editor, EditorSettings,
     EditorSnapshot, GlobalDiagnosticRenderer, Hover,
-    display_map::{InlayOffset, ToDisplayPoint, invisibles::is_invisible},
+    display_map::{InlayOffset, ToDisplayPoint, is_invisible},
     hover_links::{InlayHighlight, RangeInEditor},
+    movement::TextLayoutDetails,
     scroll::ScrollAmount,
 };
 use anyhow::Context as _;
@@ -16,7 +17,7 @@ use itertools::Itertools;
 use language::{DiagnosticEntry, Language, LanguageRegistry};
 use lsp::DiagnosticSeverity;
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
-use multi_buffer::{MultiOrSingleBufferOffsetRange, ToOffset, ToPoint};
+use multi_buffer::{MultiBufferOffset, ToOffset, ToPoint};
 use project::{HoverBlock, HoverBlockKind, InlayHintLabelPart};
 use settings::Settings;
 use std::{borrow::Cow, cell::RefCell};
@@ -27,7 +28,6 @@ use ui::{Scrollbars, WithScrollbar, prelude::*, theme_is_transparent};
 use url::Url;
 use util::TryFutureExt;
 use workspace::{OpenOptions, OpenVisible, Workspace};
-pub const HOVER_REQUEST_DELAY_MILLIS: u64 = 200;
 
 pub const MIN_POPOVER_CHARACTER_WIDTH: f32 = 20.;
 pub const MIN_POPOVER_LINE_HEIGHT: f32 = 4.;
@@ -106,7 +106,7 @@ pub fn find_hovered_hint_part(
     hovered_offset: InlayOffset,
 ) -> Option<(InlayHintLabelPart, Range<InlayOffset>)> {
     if hovered_offset >= hint_start {
-        let mut hovered_character = (hovered_offset - hint_start).0;
+        let mut hovered_character = hovered_offset - hint_start;
         let mut part_start = hint_start;
         for part in label_parts {
             let part_len = part.value.chars().count();
@@ -154,7 +154,7 @@ pub fn hover_at_inlay(
             hide_hover(editor, cx);
         }
 
-        let hover_popover_delay = EditorSettings::get_global(cx).hover_popover_delay;
+        let hover_popover_delay = EditorSettings::get_global(cx).hover_popover_delay.0;
 
         let task = cx.spawn_in(window, async move |this, cx| {
             async move {
@@ -269,13 +269,13 @@ fn show_hover(
     // Don't request again if the location is the same as the previous request
     if let Some(triggered_from) = &editor.hover_state.triggered_from
         && triggered_from
-            .cmp(&anchor, &snapshot.buffer_snapshot)
+            .cmp(&anchor, &snapshot.buffer_snapshot())
             .is_eq()
     {
         return None;
     }
 
-    let hover_popover_delay = EditorSettings::get_global(cx).hover_popover_delay;
+    let hover_popover_delay = EditorSettings::get_global(cx).hover_popover_delay.0;
     let all_diagnostics_active = editor.active_diagnostics == ActiveDiagnostic::All;
     let active_group_id = if let ActiveDiagnostic::Group(group) = &editor.active_diagnostics {
         Some(group.group_id)
@@ -290,15 +290,18 @@ fn show_hover(
             let delay = if ignore_timeout {
                 None
             } else {
+                let lsp_request_early = hover_popover_delay / 2;
+                cx.background_executor()
+                    .timer(Duration::from_millis(
+                        hover_popover_delay - lsp_request_early,
+                    ))
+                    .await;
+
                 // Construct delay task to wait for later
                 let total_delay = Some(
                     cx.background_executor()
-                        .timer(Duration::from_millis(hover_popover_delay)),
+                        .timer(Duration::from_millis(lsp_request_early)),
                 );
-
-                cx.background_executor()
-                    .timer(Duration::from_millis(HOVER_REQUEST_DELAY_MILLIS))
-                    .await;
                 total_delay
             };
 
@@ -307,39 +310,44 @@ fn show_hover(
             if let Some(delay) = delay {
                 delay.await;
             }
-
-            let offset = anchor.to_offset(&snapshot.buffer_snapshot);
+            let offset = anchor.to_offset(&snapshot.buffer_snapshot());
             let local_diagnostic = if all_diagnostics_active {
                 None
             } else {
                 snapshot
-                    .buffer_snapshot
-                    .diagnostics_with_buffer_ids_in_range::<usize>(offset..offset)
+                    .buffer_snapshot()
+                    .diagnostics_with_buffer_ids_in_range::<MultiBufferOffset>(offset..offset)
                     .filter(|(_, diagnostic)| {
                         Some(diagnostic.diagnostic.group_id) != active_group_id
                     })
                     // Find the entry with the most specific range
-                    .min_by_key(|(_, entry)| entry.range.len())
+                    .min_by_key(|(_, entry)| entry.range.end - entry.range.start)
             };
 
             let diagnostic_popover = if let Some((buffer_id, local_diagnostic)) = local_diagnostic {
                 let group = snapshot
-                    .buffer_snapshot
+                    .buffer_snapshot()
                     .diagnostic_group(buffer_id, local_diagnostic.diagnostic.group_id)
                     .collect::<Vec<_>>();
                 let point_range = local_diagnostic
                     .range
                     .start
-                    .to_point(&snapshot.buffer_snapshot)
+                    .to_point(&snapshot.buffer_snapshot())
                     ..local_diagnostic
                         .range
                         .end
-                        .to_point(&snapshot.buffer_snapshot);
+                        .to_point(&snapshot.buffer_snapshot());
                 let markdown = cx.update(|_, cx| {
                     renderer
                         .as_ref()
                         .and_then(|renderer| {
-                            renderer.render_hover(group, point_range, buffer_id, cx)
+                            renderer.render_hover(
+                                group,
+                                point_range,
+                                buffer_id,
+                                language_registry.clone(),
+                                cx,
+                            )
                         })
                         .context("no rendered diagnostic")
                 })??;
@@ -371,12 +379,12 @@ fn show_hover(
                     this.update(cx, |_, cx| cx.observe(&markdown, |_, _, cx| cx.notify()))?;
 
                 let local_diagnostic = DiagnosticEntry {
-                    diagnostic: local_diagnostic.diagnostic,
+                    diagnostic: local_diagnostic.diagnostic.to_owned(),
                     range: snapshot
-                        .buffer_snapshot
+                        .buffer_snapshot()
                         .anchor_before(local_diagnostic.range.start)
                         ..snapshot
-                            .buffer_snapshot
+                            .buffer_snapshot()
                             .anchor_after(local_diagnostic.range.end),
                 };
 
@@ -401,23 +409,23 @@ fn show_hover(
             })?;
 
             let invisible_char = if let Some(invisible) = snapshot
-                .buffer_snapshot
+                .buffer_snapshot()
                 .chars_at(anchor)
                 .next()
                 .filter(|&c| is_invisible(c))
             {
-                let after = snapshot.buffer_snapshot.anchor_after(
-                    anchor.to_offset(&snapshot.buffer_snapshot) + invisible.len_utf8(),
+                let after = snapshot.buffer_snapshot().anchor_after(
+                    anchor.to_offset(&snapshot.buffer_snapshot()) + invisible.len_utf8(),
                 );
                 Some((invisible, anchor..after))
             } else if let Some(invisible) = snapshot
-                .buffer_snapshot
+                .buffer_snapshot()
                 .reversed_chars_at(anchor)
                 .next()
                 .filter(|&c| is_invisible(c))
             {
-                let before = snapshot.buffer_snapshot.anchor_before(
-                    anchor.to_offset(&snapshot.buffer_snapshot) - invisible.len_utf8(),
+                let before = snapshot.buffer_snapshot().anchor_before(
+                    anchor.to_offset(&snapshot.buffer_snapshot()) - invisible.len_utf8(),
                 );
 
                 Some((invisible, before..anchor))
@@ -467,23 +475,15 @@ fn show_hover(
                 let range = hover_result
                     .range
                     .and_then(|range| {
-                        let start = snapshot
-                            .buffer_snapshot
-                            .anchor_in_excerpt(excerpt_id, range.start)?;
-                        let end = snapshot
-                            .buffer_snapshot
-                            .anchor_in_excerpt(excerpt_id, range.end)?;
-                        Some(start..end)
+                        let range = snapshot
+                            .buffer_snapshot()
+                            .anchor_range_in_excerpt(excerpt_id, range)?;
+                        Some(range)
                     })
                     .or_else(|| {
-                        let snapshot = &snapshot.buffer_snapshot;
-                        match snapshot.syntax_ancestor(anchor..anchor)?.1 {
-                            MultiOrSingleBufferOffsetRange::Multi(range) => Some(
-                                snapshot.anchor_before(range.start)
-                                    ..snapshot.anchor_after(range.end),
-                            ),
-                            MultiOrSingleBufferOffsetRange::Single(_) => None,
-                        }
+                        let snapshot = &snapshot.buffer_snapshot();
+                        let range = snapshot.syntax_ancestor(anchor..anchor)?.1;
+                        Some(snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end))
                     })
                     .unwrap_or_else(|| anchor..anchor);
 
@@ -547,8 +547,8 @@ fn same_info_hover(editor: &Editor, snapshot: &EditorSnapshot, anchor: Anchor) -
             symbol_range
                 .as_text_range()
                 .map(|range| {
-                    let hover_range = range.to_offset(&snapshot.buffer_snapshot);
-                    let offset = anchor.to_offset(&snapshot.buffer_snapshot);
+                    let hover_range = range.to_offset(&snapshot.buffer_snapshot());
+                    let offset = anchor.to_offset(&snapshot.buffer_snapshot());
                     // LSP returns a hover result for the end index of ranges that should be hovered, so we need to
                     // use an inclusive range here to check if we should dismiss the popover
                     (hover_range.start..=hover_range.end).contains(&offset)
@@ -566,8 +566,8 @@ fn same_diagnostic_hover(editor: &Editor, snapshot: &EditorSnapshot, anchor: Anc
             let hover_range = diagnostic
                 .local_diagnostic
                 .range
-                .to_offset(&snapshot.buffer_snapshot);
-            let offset = anchor.to_offset(&snapshot.buffer_snapshot);
+                .to_offset(&snapshot.buffer_snapshot());
+            let offset = anchor.to_offset(&snapshot.buffer_snapshot());
 
             // Here we do basically the same as in `same_info_hover`, see comment there for an explanation
             (hover_range.start..=hover_range.end).contains(&offset)
@@ -773,9 +773,13 @@ impl HoverState {
         snapshot: &EditorSnapshot,
         visible_rows: Range<DisplayRow>,
         max_size: Size<Pixels>,
+        text_layout_details: &TextLayoutDetails,
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Option<(DisplayPoint, Vec<AnyElement>)> {
+        if !self.visible() {
+            return None;
+        }
         // If there is a diagnostic, position the popovers based on that.
         // Otherwise use the start of the hover range
         let anchor = self
@@ -798,10 +802,32 @@ impl HoverState {
                     }
                 })
             })?;
-        let point = anchor.to_display_point(&snapshot.display_snapshot);
+        let mut point = anchor.to_display_point(&snapshot.display_snapshot);
+        // Clamp the point within the visible rows in case the popup source spans multiple lines
+        if visible_rows.end <= point.row() {
+            point = crate::movement::up_by_rows(
+                &snapshot.display_snapshot,
+                point,
+                1 + (point.row() - visible_rows.end).0,
+                text::SelectionGoal::None,
+                true,
+                text_layout_details,
+            )
+            .0;
+        } else if point.row() < visible_rows.start {
+            point = crate::movement::down_by_rows(
+                &snapshot.display_snapshot,
+                point,
+                (visible_rows.start - point.row()).0,
+                text::SelectionGoal::None,
+                true,
+                text_layout_details,
+            )
+            .0;
+        }
 
-        // Don't render if the relevant point isn't on screen
-        if !self.visible() || !visible_rows.contains(&point.row()) {
+        if !visible_rows.contains(&point.row()) {
+            log::error!("Hover popover point out of bounds after moving");
             return None;
         }
 
@@ -867,7 +893,6 @@ impl InfoPopover {
                 *keyboard_grace = false;
                 cx.stop_propagation();
             })
-            .p_2()
             .when_some(self.parsed_content.clone(), |this, markdown| {
                 this.child(
                     div()
@@ -883,12 +908,13 @@ impl InfoPopover {
                                     copy_button_on_hover: false,
                                     border: false,
                                 })
-                                .on_url_click(open_markdown_url),
+                                .on_url_click(open_markdown_url)
+                                .p_2(),
                         ),
                 )
                 .custom_scrollbars(
                     Scrollbars::for_settings::<EditorSettings>()
-                        .tracked_scroll_handle(self.scroll_handle.clone()),
+                        .tracked_scroll_handle(&self.scroll_handle),
                     window,
                     cx,
                 )
@@ -966,6 +992,11 @@ impl DiagnosticPopover {
                                     self.markdown.clone(),
                                     diagnostics_markdown_style(window, cx),
                                 )
+                                .code_block_renderer(markdown::CodeBlockRenderer::Default {
+                                    copy_button: false,
+                                    copy_button_on_hover: false,
+                                    border: false,
+                                })
                                 .on_url_click(
                                     move |link, window, cx| {
                                         if let Some(renderer) = GlobalDiagnosticRenderer::global(cx)
@@ -981,7 +1012,7 @@ impl DiagnosticPopover {
                     )
                     .custom_scrollbars(
                         Scrollbars::for_settings::<EditorSettings>()
-                            .tracked_scroll_handle(self.scroll_handle.clone()),
+                            .tracked_scroll_handle(&self.scroll_handle),
                         window,
                         cx,
                     ),
@@ -994,25 +1025,25 @@ impl DiagnosticPopover {
 mod tests {
     use super::*;
     use crate::{
-        InlayId, PointForPosition,
+        PointForPosition,
         actions::ConfirmCompletion,
         editor_tests::{handle_completion_request, init_test},
-        hover_links::update_inlay_link_and_hover_points,
-        inlay_hint_cache::tests::{cached_hint_labels, visible_hint_labels},
+        inlays::inlay_hints::tests::{cached_hint_labels, visible_hint_labels},
         test::editor_lsp_test_context::EditorLspTestContext,
     };
     use collections::BTreeSet;
     use gpui::App;
     use indoc::indoc;
-    use language::language_settings::InlayHintSettings;
     use markdown::parser::MarkdownEvent;
+    use project::InlayId;
+    use settings::InlayHintSettingsContent;
     use smol::stream::StreamExt;
     use std::sync::atomic;
     use std::sync::atomic::AtomicUsize;
     use text::Bias;
 
     fn get_hover_popover_delay(cx: &gpui::TestAppContext) -> u64 {
-        cx.read(|cx: &App| -> u64 { EditorSettings::get_global(cx).hover_popover_delay })
+        cx.read(|cx: &App| -> u64 { EditorSettings::get_global(cx).hover_popover_delay.0 })
     }
 
     impl InfoPopover {
@@ -1095,7 +1126,7 @@ mod tests {
         cx.update_editor(|editor, window, cx| {
             let snapshot = editor.snapshot(window, cx);
             let anchor = snapshot
-                .buffer_snapshot
+                .buffer_snapshot()
                 .anchor_before(hover_point.to_offset(&snapshot, Bias::Left));
             hover_at(editor, Some(anchor), window, cx)
         });
@@ -1195,7 +1226,7 @@ mod tests {
         cx.update_editor(|editor, window, cx| {
             let snapshot = editor.snapshot(window, cx);
             let anchor = snapshot
-                .buffer_snapshot
+                .buffer_snapshot()
                 .anchor_before(hover_point.to_offset(&snapshot, Bias::Left));
             hover_at(editor, Some(anchor), window, cx)
         });
@@ -1233,7 +1264,7 @@ mod tests {
         cx.update_editor(|editor, window, cx| {
             let snapshot = editor.snapshot(window, cx);
             let anchor = snapshot
-                .buffer_snapshot
+                .buffer_snapshot()
                 .anchor_before(hover_point.to_offset(&snapshot, Bias::Left));
             hover_at(editor, Some(anchor), window, cx)
         });
@@ -1287,7 +1318,7 @@ mod tests {
         cx.update_editor(|editor, window, cx| {
             let snapshot = editor.snapshot(window, cx);
             let anchor = snapshot
-                .buffer_snapshot
+                .buffer_snapshot()
                 .anchor_before(hover_point.to_offset(&snapshot, Bias::Left));
             hover_at(editor, Some(anchor), window, cx)
         });
@@ -1551,15 +1582,15 @@ mod tests {
     #[gpui::test]
     async fn test_hover_inlay_label_parts(cx: &mut gpui::TestAppContext) {
         init_test(cx, |settings| {
-            settings.defaults.inlay_hints = Some(InlayHintSettings {
-                show_value_hints: true,
-                enabled: true,
-                edit_debounce_ms: 0,
-                scroll_debounce_ms: 0,
-                show_type_hints: true,
-                show_parameter_hints: true,
-                show_other_hints: true,
-                show_background: false,
+            settings.defaults.inlay_hints = Some(InlayHintSettingsContent {
+                show_value_hints: Some(true),
+                enabled: Some(true),
+                edit_debounce_ms: Some(0),
+                scroll_debounce_ms: Some(0),
+                show_type_hints: Some(true),
+                show_parameter_hints: Some(true),
+                show_other_hints: Some(true),
+                show_background: Some(false),
                 toggle_on_modifiers_press: None,
             })
         });
@@ -1602,7 +1633,7 @@ mod tests {
             }
         "})[0]
             .start;
-        let hint_position = cx.to_lsp(hint_start_offset);
+        let hint_position = cx.to_lsp(MultiBufferOffset(hint_start_offset));
         let new_type_target_range = cx.lsp_range(indoc! {"
             struct TestStruct;
 
@@ -1656,7 +1687,7 @@ mod tests {
         cx.background_executor.run_until_parked();
         cx.update_editor(|editor, _, cx| {
             let expected_layers = vec![entire_hint_label.to_string()];
-            assert_eq!(expected_layers, cached_hint_labels(editor));
+            assert_eq!(expected_layers, cached_hint_labels(editor, cx));
             assert_eq!(expected_layers, visible_hint_labels(editor, cx));
         });
 
@@ -1677,8 +1708,8 @@ mod tests {
             .unwrap();
         let new_type_hint_part_hover_position = cx.update_editor(|editor, window, cx| {
             let snapshot = editor.snapshot(window, cx);
-            let previous_valid = inlay_range.start.to_display_point(&snapshot);
-            let next_valid = inlay_range.end.to_display_point(&snapshot);
+            let previous_valid = MultiBufferOffset(inlay_range.start).to_display_point(&snapshot);
+            let next_valid = MultiBufferOffset(inlay_range.end).to_display_point(&snapshot);
             assert_eq!(previous_valid.row(), next_valid.row());
             assert!(previous_valid.column() < next_valid.column());
             let exact_unclipped = DisplayPoint::new(
@@ -1695,10 +1726,9 @@ mod tests {
             }
         });
         cx.update_editor(|editor, window, cx| {
-            update_inlay_link_and_hover_points(
+            editor.update_inlay_link_and_hover_points(
                 &editor.snapshot(window, cx),
                 new_type_hint_part_hover_position,
-                editor,
                 true,
                 false,
                 window,
@@ -1766,10 +1796,9 @@ mod tests {
         cx.background_executor.run_until_parked();
 
         cx.update_editor(|editor, window, cx| {
-            update_inlay_link_and_hover_points(
+            editor.update_inlay_link_and_hover_points(
                 &editor.snapshot(window, cx),
                 new_type_hint_part_hover_position,
-                editor,
                 true,
                 false,
                 window,
@@ -1790,7 +1819,8 @@ mod tests {
                 popover.symbol_range,
                 RangeInEditor::Inlay(InlayHighlight {
                     inlay: InlayId::Hint(0),
-                    inlay_position: buffer_snapshot.anchor_at(inlay_range.start, Bias::Right),
+                    inlay_position: buffer_snapshot
+                        .anchor_after(MultiBufferOffset(inlay_range.start)),
                     range: ": ".len()..": ".len() + new_type_label.len(),
                 }),
                 "Popover range should match the new type label part"
@@ -1803,8 +1833,8 @@ mod tests {
 
         let struct_hint_part_hover_position = cx.update_editor(|editor, window, cx| {
             let snapshot = editor.snapshot(window, cx);
-            let previous_valid = inlay_range.start.to_display_point(&snapshot);
-            let next_valid = inlay_range.end.to_display_point(&snapshot);
+            let previous_valid = MultiBufferOffset(inlay_range.start).to_display_point(&snapshot);
+            let next_valid = MultiBufferOffset(inlay_range.end).to_display_point(&snapshot);
             assert_eq!(previous_valid.row(), next_valid.row());
             assert!(previous_valid.column() < next_valid.column());
             let exact_unclipped = DisplayPoint::new(
@@ -1821,10 +1851,9 @@ mod tests {
             }
         });
         cx.update_editor(|editor, window, cx| {
-            update_inlay_link_and_hover_points(
+            editor.update_inlay_link_and_hover_points(
                 &editor.snapshot(window, cx),
                 struct_hint_part_hover_position,
-                editor,
                 true,
                 false,
                 window,
@@ -1845,7 +1874,8 @@ mod tests {
                 popover.symbol_range,
                 RangeInEditor::Inlay(InlayHighlight {
                     inlay: InlayId::Hint(0),
-                    inlay_position: buffer_snapshot.anchor_at(inlay_range.start, Bias::Right),
+                    inlay_position: buffer_snapshot
+                        .anchor_after(MultiBufferOffset(inlay_range.start)),
                     range: ": ".len() + new_type_label.len() + "<".len()
                         ..": ".len() + new_type_label.len() + "<".len() + struct_label.len(),
                 }),

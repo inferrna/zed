@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "We are not in an async environment, so std::process::Command is fine"
+)]
 #![cfg_attr(
     any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
     allow(dead_code)
@@ -8,7 +12,9 @@ use clap::Parser;
 use cli::{CliRequest, CliResponse, IpcHandshake, ipc::IpcOneShotServer};
 use parking_lot::Mutex;
 use std::{
-    env, fs, io,
+    env,
+    ffi::OsStr,
+    fs, io,
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::Arc,
@@ -19,6 +25,8 @@ use util::paths::PathWithPosition;
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::io::IsTerminal;
+
+const URL_PREFIX: [&'static str; 5] = ["zed://", "http://", "https://", "file://", "ssh://"];
 
 struct Detect;
 
@@ -56,16 +64,22 @@ struct Args {
     #[arg(short, long)]
     wait: bool,
     /// Add files to the currently open workspace
-    #[arg(short, long, overrides_with = "new")]
+    #[arg(short, long, overrides_with_all = ["new", "reuse"])]
     add: bool,
     /// Create a new workspace
-    #[arg(short, long, overrides_with = "add")]
+    #[arg(short, long, overrides_with_all = ["add", "reuse"])]
     new: bool,
+    /// Reuse an existing window, replacing its workspace
+    #[arg(short, long, overrides_with_all = ["add", "new"])]
+    reuse: bool,
     /// Sets a custom directory for all user data (e.g., database, extensions, logs).
-    /// This overrides the default platform-specific data directory location.
-    /// On macOS, the default is `~/Library/Application Support/Zed`.
-    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/zed`.
-    /// On Windows, the default is `%LOCALAPPDATA%\Zed`.
+    /// This overrides the default platform-specific data directory location:
+    #[cfg_attr(target_os = "macos", doc = "`~/Library/Application Support/Zed`.")]
+    #[cfg_attr(target_os = "windows", doc = "`%LOCALAPPDATA%\\Zed`.")]
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos")),
+        doc = "`$XDG_DATA_HOME/zed`."
+    )]
     #[arg(long, value_name = "DIR")]
     user_data_dir: Option<String>,
     /// The paths to open in Zed (space-separated).
@@ -110,38 +124,184 @@ struct Args {
     ))]
     #[arg(long)]
     uninstall: bool,
+
+    /// Used for SSH/Git password authentication, to remove the need for netcat as a dependency,
+    /// by having Zed act like netcat communicating over a Unix socket.
+    #[arg(long, hide = true)]
+    askpass: Option<String>,
 }
 
+/// Parses a path containing a position (e.g. `path:line:column`)
+/// and returns its canonicalized string representation.
+///
+/// If a part of path doesn't exist, it will canonicalize the
+/// existing part and append the non-existing part.
+///
+/// This method must return an absolute path, as many zed
+/// crates assume absolute paths.
 fn parse_path_with_position(argument_str: &str) -> anyhow::Result<String> {
-    let canonicalized = match Path::new(argument_str).canonicalize() {
-        Ok(existing_path) => PathWithPosition::from_path(existing_path),
-        Err(_) => {
-            let path = PathWithPosition::parse_str(argument_str);
+    match Path::new(argument_str).canonicalize() {
+        Ok(existing_path) => Ok(PathWithPosition::from_path(existing_path)),
+        Err(_) => PathWithPosition::parse_str(argument_str).map_path(|mut path| {
             let curdir = env::current_dir().context("retrieving current directory")?;
-            path.map_path(|path| match fs::canonicalize(&path) {
-                Ok(path) => Ok(path),
-                Err(e) => {
-                    if let Some(mut parent) = path.parent() {
-                        if parent == Path::new("") {
-                            parent = &curdir
-                        }
-                        match fs::canonicalize(parent) {
-                            Ok(parent) => Ok(parent.join(path.file_name().unwrap())),
-                            Err(_) => Err(e),
-                        }
-                    } else {
-                        Err(e)
-                    }
+            let mut children = Vec::new();
+            let root;
+            loop {
+                // canonicalize handles './', and '/'.
+                if let Ok(canonicalized) = fs::canonicalize(&path) {
+                    root = canonicalized;
+                    break;
                 }
-            })
-        }
-        .with_context(|| format!("parsing as path with position {argument_str}"))?,
-    };
-    Ok(canonicalized.to_string(|path| path.to_string_lossy().to_string()))
+                // The comparison to `curdir` is just a shortcut
+                // since we know it is canonical. The other one
+                // is if `argument_str` is a string that starts
+                // with a name (e.g. "foo/bar").
+                if path == curdir || path == Path::new("") {
+                    root = curdir;
+                    break;
+                }
+                children.push(
+                    path.file_name()
+                        .with_context(|| format!("parsing as path with position {argument_str}"))?
+                        .to_owned(),
+                );
+                if !path.pop() {
+                    unreachable!("parsing as path with position {argument_str}");
+                }
+            }
+            Ok(children.iter().rev().fold(root, |mut path, child| {
+                path.push(child);
+                path
+            }))
+        }),
+    }
+    .map(|path_with_pos| path_with_pos.to_string(|path| path.to_string_lossy().into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use util::path;
+    use util::paths::SanitizedPath;
+    use util::test::TempTree;
+
+    macro_rules! assert_path_eq {
+        ($left:expr, $right:expr) => {
+            assert_eq!(
+                SanitizedPath::new(Path::new(&$left)),
+                SanitizedPath::new(Path::new(&$right))
+            )
+        };
+    }
+
+    fn cwd() -> PathBuf {
+        env::current_dir().unwrap()
+    }
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_cwd<T>(path: &Path, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let _lock = CWD_LOCK.lock();
+        let old_cwd = cwd();
+        env::set_current_dir(path)?;
+        let result = f();
+        env::set_current_dir(old_cwd)?;
+        result
+    }
+
+    #[test]
+    fn test_parse_non_existing_path() {
+        // Absolute path
+        let result = parse_path_with_position(path!("/non/existing/path.txt")).unwrap();
+        assert_path_eq!(result, path!("/non/existing/path.txt"));
+
+        // Absolute path in cwd
+        let path = cwd().join(path!("non/existing/path.txt"));
+        let expected = path.to_string_lossy().to_string();
+        let result = parse_path_with_position(&expected).unwrap();
+        assert_path_eq!(result, expected);
+
+        // Relative path
+        let result = parse_path_with_position(path!("non/existing/path.txt")).unwrap();
+        assert_path_eq!(result, expected)
+    }
+
+    #[test]
+    fn test_parse_existing_path() {
+        let temp_tree = TempTree::new(json!({
+            "file.txt": "",
+        }));
+        let file_path = temp_tree.path().join("file.txt");
+        let expected = file_path.to_string_lossy().to_string();
+
+        // Absolute path
+        let result = parse_path_with_position(file_path.to_str().unwrap()).unwrap();
+        assert_path_eq!(result, expected);
+
+        // Relative path
+        let result = with_cwd(temp_tree.path(), || parse_path_with_position("file.txt")).unwrap();
+        assert_path_eq!(result, expected);
+    }
+
+    // NOTE:
+    // While POSIX symbolic links are somewhat supported on Windows, they are an opt in by the user, and thus
+    // we assume that they are not supported out of the box.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_parse_symlink_file() {
+        let temp_tree = TempTree::new(json!({
+            "target.txt": "",
+        }));
+        let target_path = temp_tree.path().join("target.txt");
+        let symlink_path = temp_tree.path().join("symlink.txt");
+        std::os::unix::fs::symlink(&target_path, &symlink_path).unwrap();
+
+        // Absolute path
+        let result = parse_path_with_position(symlink_path.to_str().unwrap()).unwrap();
+        assert_eq!(result, target_path.to_string_lossy());
+
+        // Relative path
+        let result =
+            with_cwd(temp_tree.path(), || parse_path_with_position("symlink.txt")).unwrap();
+        assert_eq!(result, target_path.to_string_lossy());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_parse_symlink_dir() {
+        let temp_tree = TempTree::new(json!({
+            "some": {
+                "dir": { // symlink target
+                    "ec": {
+                        "tory": {
+                            "file.txt": "",
+        }}}}}));
+
+        let target_file_path = temp_tree.path().join("some/dir/ec/tory/file.txt");
+        let expected = target_file_path.to_string_lossy();
+
+        let dir_path = temp_tree.path().join("some/dir");
+        let symlink_path = temp_tree.path().join("symlink");
+        std::os::unix::fs::symlink(&dir_path, &symlink_path).unwrap();
+
+        // Absolute path
+        let result =
+            parse_path_with_position(symlink_path.join("ec/tory/file.txt").to_str().unwrap())
+                .unwrap();
+        assert_eq!(result, expected);
+
+        // Relative path
+        let result = with_cwd(temp_tree.path(), || {
+            parse_path_with_position("symlink/ec/tory/file.txt")
+        })
+        .unwrap();
+        assert_eq!(result, expected);
+    }
 }
 
 fn parse_path_in_wsl(source: &str, wsl: &str) -> Result<String> {
-    let mut command = util::command::new_std_command("wsl.exe");
+    let mut source = PathWithPosition::parse_str(source);
 
     let (user, distro_name) = if let Some((user, distro)) = wsl.split_once('@') {
         if user.is_empty() {
@@ -152,26 +312,37 @@ fn parse_path_in_wsl(source: &str, wsl: &str) -> Result<String> {
         (None, wsl)
     };
 
+    let mut args = vec!["--distribution", distro_name];
     if let Some(user) = user {
-        command.arg("--user").arg(user);
+        args.push("--user");
+        args.push(user);
     }
 
-    let output = command
-        .arg("--distribution")
-        .arg(distro_name)
-        .arg("wslpath")
-        .arg("-m")
-        .arg(source)
+    let command = [
+        OsStr::new("realpath"),
+        OsStr::new("-s"),
+        source.path.as_ref(),
+    ];
+
+    let output = util::command::new_std_command("wsl.exe")
+        .args(&args)
+        .arg("--exec")
+        .args(&command)
         .output()?;
+    let result = if output.status.success() {
+        String::from_utf8_lossy(&output.stdout).to_string()
+    } else {
+        let fallback = util::command::new_std_command("wsl.exe")
+            .args(&args)
+            .arg("--")
+            .args(&command)
+            .output()?;
+        String::from_utf8_lossy(&fallback.stdout).to_string()
+    };
 
-    let result = String::from_utf8_lossy(&output.stdout);
-    let prefix = format!("//wsl.localhost/{}", distro_name);
+    source.path = Path::new(result.trim()).to_owned();
 
-    Ok(result
-        .trim()
-        .strip_prefix(&prefix)
-        .unwrap_or(&result)
-        .to_string())
+    Ok(source.to_string(|path| path.to_string_lossy().into_owned()))
 }
 
 fn main() -> Result<()> {
@@ -196,6 +367,12 @@ fn main() -> Result<()> {
         }
     }
     let args = Args::parse();
+
+    // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
+    if let Some(socket) = &args.askpass {
+        askpass::main(socket);
+        return Ok(());
+    }
 
     // Set custom data directory before any path operations
     let user_data_dir = args.user_data_dir.clone();
@@ -310,21 +487,16 @@ fn main() -> Result<()> {
     let wsl = None;
 
     for path in args.paths_with_position.iter() {
-        if path.starts_with("zed://")
-            || path.starts_with("http://")
-            || path.starts_with("https://")
-            || path.starts_with("file://")
-            || path.starts_with("ssh://")
-        {
+        if URL_PREFIX.iter().any(|&prefix| path.starts_with(prefix)) {
             urls.push(path.to_string());
         } else if path == "-" && args.paths_with_position.len() == 1 {
             let file = NamedTempFile::new()?;
-            paths.push(file.path().to_string_lossy().to_string());
+            paths.push(file.path().to_string_lossy().into_owned());
             let (file, _) = file.keep()?;
             stdin_tmp_file = Some(file);
         } else if let Some(file) = anonymous_fd(path) {
             let tmp_file = NamedTempFile::new()?;
-            paths.push(tmp_file.path().to_string_lossy().to_string());
+            paths.push(tmp_file.path().to_string_lossy().into_owned());
             let (tmp_file, _) = tmp_file.keep()?;
             anonymous_fd_tmp_files.push((file, tmp_file));
         } else if let Some(wsl) = wsl {
@@ -339,59 +511,78 @@ fn main() -> Result<()> {
         "Dev servers were removed in v0.157.x please upgrade to SSH remoting: https://zed.dev/docs/remote-development"
     );
 
-    let sender: JoinHandle<anyhow::Result<()>> = thread::spawn({
-        let exit_status = exit_status.clone();
-        let user_data_dir_for_thread = user_data_dir.clone();
-        move || {
-            let (_, handshake) = server.accept().context("Handshake after Zed spawn")?;
-            let (tx, rx) = (handshake.requests, handshake.responses);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .stack_size(10 * 1024 * 1024)
+        .thread_name(|ix| format!("RayonWorker{}", ix))
+        .build_global()
+        .unwrap();
 
-            #[cfg(target_os = "windows")]
-            let wsl = args.wsl;
-            #[cfg(not(target_os = "windows"))]
-            let wsl = None;
+    let sender: JoinHandle<anyhow::Result<()>> = thread::Builder::new()
+        .name("CliReceiver".to_string())
+        .spawn({
+            let exit_status = exit_status.clone();
+            let user_data_dir_for_thread = user_data_dir.clone();
+            move || {
+                let (_, handshake) = server.accept().context("Handshake after Zed spawn")?;
+                let (tx, rx) = (handshake.requests, handshake.responses);
 
-            tx.send(CliRequest::Open {
-                paths,
-                urls,
-                diff_paths,
-                wsl,
-                wait: args.wait,
-                open_new_workspace,
-                env,
-                user_data_dir: user_data_dir_for_thread,
-            })?;
+                #[cfg(target_os = "windows")]
+                let wsl = args.wsl;
+                #[cfg(not(target_os = "windows"))]
+                let wsl = None;
 
-            while let Ok(response) = rx.recv() {
-                match response {
-                    CliResponse::Ping => {}
-                    CliResponse::Stdout { message } => println!("{message}"),
-                    CliResponse::Stderr { message } => eprintln!("{message}"),
-                    CliResponse::Exit { status } => {
-                        exit_status.lock().replace(status);
-                        return Ok(());
+                tx.send(CliRequest::Open {
+                    paths,
+                    urls,
+                    diff_paths,
+                    wsl,
+                    wait: args.wait,
+                    open_new_workspace,
+                    reuse: args.reuse,
+                    env,
+                    user_data_dir: user_data_dir_for_thread,
+                })?;
+
+                while let Ok(response) = rx.recv() {
+                    match response {
+                        CliResponse::Ping => {}
+                        CliResponse::Stdout { message } => println!("{message}"),
+                        CliResponse::Stderr { message } => eprintln!("{message}"),
+                        CliResponse::Exit { status } => {
+                            exit_status.lock().replace(status);
+                            return Ok(());
+                        }
                     }
                 }
-            }
 
-            Ok(())
-        }
-    });
+                Ok(())
+            }
+        })
+        .unwrap();
 
     let stdin_pipe_handle: Option<JoinHandle<anyhow::Result<()>>> =
         stdin_tmp_file.map(|mut tmp_file| {
-            thread::spawn(move || {
-                let mut stdin = std::io::stdin().lock();
-                if !io::IsTerminal::is_terminal(&stdin) {
-                    io::copy(&mut stdin, &mut tmp_file)?;
-                }
-                Ok(())
-            })
+            thread::Builder::new()
+                .name("CliStdin".to_string())
+                .spawn(move || {
+                    let mut stdin = std::io::stdin().lock();
+                    if !io::IsTerminal::is_terminal(&stdin) {
+                        io::copy(&mut stdin, &mut tmp_file)?;
+                    }
+                    Ok(())
+                })
+                .unwrap()
         });
 
     let anonymous_fd_pipe_handles: Vec<_> = anonymous_fd_tmp_files
         .into_iter()
-        .map(|(mut file, mut tmp_file)| thread::spawn(move || io::copy(&mut file, &mut tmp_file)))
+        .map(|(mut file, mut tmp_file)| {
+            thread::Builder::new()
+                .name("CliAnonymousFd".to_string())
+                .spawn(move || io::copy(&mut file, &mut tmp_file))
+                .unwrap()
+        })
         .collect();
 
     if args.foreground {
@@ -708,15 +899,15 @@ mod windows {
             Storage::FileSystem::{
                 CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, OPEN_EXISTING, WriteFile,
             },
-            System::Threading::{CREATE_NEW_PROCESS_GROUP, CreateMutexW},
+            System::Threading::CreateMutexW,
         },
         core::HSTRING,
     };
 
     use crate::{Detect, InstalledApp};
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
-    use std::{io, os::windows::process::CommandExt};
 
     fn check_single_instance() -> bool {
         let mutex = unsafe {
@@ -755,7 +946,6 @@ mod windows {
         fn launch(&self, ipc_url: String) -> anyhow::Result<()> {
             if check_single_instance() {
                 std::process::Command::new(self.0.clone())
-                    .creation_flags(CREATE_NEW_PROCESS_GROUP.0)
                     .arg(ipc_url)
                     .spawn()?;
             } else {

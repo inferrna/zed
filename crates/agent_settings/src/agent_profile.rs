@@ -1,15 +1,17 @@
 use std::sync::Arc;
 
+use anyhow::{Result, bail};
 use collections::IndexMap;
 use convert_case::{Case, Casing as _};
 use fs::Fs;
 use gpui::{App, SharedString};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use settings::{Settings as _, update_settings_file};
+use settings::{
+    AgentProfileContent, ContextServerPresetContent, LanguageModelSelection, Settings as _,
+    SettingsContent, update_settings_file,
+};
 use util::ResultExt as _;
 
-use crate::AgentSettings;
+use crate::{AgentProfileId, AgentSettings};
 
 pub mod builtin_profiles {
     use super::AgentProfileId;
@@ -20,27 +22,6 @@ pub mod builtin_profiles {
 
     pub fn is_builtin(profile_id: &AgentProfileId) -> bool {
         profile_id.as_str() == WRITE || profile_id.as_str() == ASK || profile_id.as_str() == MINIMAL
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AgentProfileId(pub Arc<str>);
-
-impl AgentProfileId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for AgentProfileId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl Default for AgentProfileId {
-    fn default() -> Self {
-        Self("write".into())
     }
 }
 
@@ -72,25 +53,36 @@ impl AgentProfile {
         let base_profile =
             base_profile_id.and_then(|id| AgentSettings::get_global(cx).profiles.get(&id).cloned());
 
+        // Copy toggles from the base profile so the new profile starts with familiar defaults.
+        let tools = base_profile
+            .as_ref()
+            .map(|profile| profile.tools.clone())
+            .unwrap_or_default();
+        let enable_all_context_servers = base_profile
+            .as_ref()
+            .map(|profile| profile.enable_all_context_servers)
+            .unwrap_or_default();
+        let context_servers = base_profile
+            .as_ref()
+            .map(|profile| profile.context_servers.clone())
+            .unwrap_or_default();
+        // Preserve the base profile's model preference when cloning into a new profile.
+        let default_model = base_profile
+            .as_ref()
+            .and_then(|profile| profile.default_model.clone());
+
         let profile_settings = AgentProfileSettings {
             name: name.into(),
-            tools: base_profile
-                .as_ref()
-                .map(|profile| profile.tools.clone())
-                .unwrap_or_default(),
-            enable_all_context_servers: base_profile
-                .as_ref()
-                .map(|profile| profile.enable_all_context_servers)
-                .unwrap_or_default(),
-            context_servers: base_profile
-                .map(|profile| profile.context_servers)
-                .unwrap_or_default(),
+            tools,
+            enable_all_context_servers,
+            context_servers,
+            default_model,
         };
 
-        update_settings_file::<AgentSettings>(fs, cx, {
+        update_settings_file(fs, cx, {
             let id = id.clone();
             move |settings, _cx| {
-                settings.create_profile(id, profile_settings).log_err();
+                profile_settings.save_to_settings(id, settings).log_err();
             }
         });
 
@@ -115,6 +107,8 @@ pub struct AgentProfileSettings {
     pub tools: IndexMap<Arc<str>, bool>,
     pub enable_all_context_servers: bool,
     pub context_servers: IndexMap<Arc<str>, ContextServerPreset>,
+    /// Default language model to apply when this profile becomes active.
+    pub default_model: Option<LanguageModelSelection>,
 }
 
 impl AgentProfileSettings {
@@ -129,9 +123,80 @@ impl AgentProfileSettings {
                 .get(server_id)
                 .is_some_and(|preset| preset.tools.get(tool_name) == Some(&true))
     }
+
+    pub fn save_to_settings(
+        &self,
+        profile_id: AgentProfileId,
+        content: &mut SettingsContent,
+    ) -> Result<()> {
+        let profiles = content
+            .agent
+            .get_or_insert_default()
+            .profiles
+            .get_or_insert_default();
+        if profiles.contains_key(&profile_id.0) {
+            bail!("profile with ID '{profile_id}' already exists");
+        }
+
+        profiles.insert(
+            profile_id.0,
+            AgentProfileContent {
+                name: self.name.clone().into(),
+                tools: self.tools.clone(),
+                enable_all_context_servers: Some(self.enable_all_context_servers),
+                context_servers: self
+                    .context_servers
+                    .clone()
+                    .into_iter()
+                    .map(|(server_id, preset)| {
+                        (
+                            server_id,
+                            ContextServerPresetContent {
+                                tools: preset.tools,
+                            },
+                        )
+                    })
+                    .collect(),
+                default_model: self.default_model.clone(),
+            },
+        );
+
+        Ok(())
+    }
+}
+
+impl From<AgentProfileContent> for AgentProfileSettings {
+    fn from(content: AgentProfileContent) -> Self {
+        let AgentProfileContent {
+            name,
+            tools,
+            enable_all_context_servers,
+            context_servers,
+            default_model,
+        } = content;
+
+        Self {
+            name: name.into(),
+            tools,
+            enable_all_context_servers: enable_all_context_servers.unwrap_or_default(),
+            context_servers: context_servers
+                .into_iter()
+                .map(|(server_id, preset)| (server_id, preset.into()))
+                .collect(),
+            default_model,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ContextServerPreset {
     pub tools: IndexMap<Arc<str>, bool>,
+}
+
+impl From<settings::ContextServerPresetContent> for ContextServerPreset {
+    fn from(content: settings::ContextServerPresetContent) -> Self {
+        Self {
+            tools: content.tools,
+        }
+    }
 }

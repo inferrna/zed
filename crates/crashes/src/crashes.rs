@@ -3,6 +3,7 @@ use log::info;
 use minidumper::{Client, LoopAction, MinidumpBinary};
 use release_channel::{RELEASE_CHANNEL, ReleaseChannel};
 use serde::{Deserialize, Serialize};
+use smol::process::Command;
 
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicU32;
@@ -12,7 +13,7 @@ use std::{
     io,
     panic::{self, PanicHookInfo},
     path::{Path, PathBuf},
-    process::{self, Command},
+    process::{self},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -32,17 +33,33 @@ const CRASH_HANDLER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 static PANIC_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 
 pub async fn init(crash_init: InitCrashHandler) {
-    if *RELEASE_CHANNEL == ReleaseChannel::Dev && env::var("ZED_GENERATE_MINIDUMPS").is_err() {
-        let old_hook = panic::take_hook();
-        panic::set_hook(Box::new(move |info| {
-            unsafe { env::set_var("RUST_BACKTRACE", "1") };
-            old_hook(info);
-            // prevent the macOS crash dialog from popping up
-            std::process::exit(1);
-        }));
-        return;
-    } else {
-        panic::set_hook(Box::new(panic_hook));
+    let gen_var = match env::var("ZED_GENERATE_MINIDUMPS") {
+        Ok(v) => {
+            if v == "false" || v == "0" {
+                Some(false)
+            } else {
+                Some(true)
+            }
+        }
+        Err(_) => None,
+    };
+
+    match (gen_var, *RELEASE_CHANNEL) {
+        (Some(false), _) | (None, ReleaseChannel::Dev) => {
+            let old_hook = panic::take_hook();
+            panic::set_hook(Box::new(move |info| {
+                unsafe { env::set_var("RUST_BACKTRACE", "1") };
+                old_hook(info);
+                // prevent the macOS crash dialog from popping up
+                if cfg!(target_os = "macos") {
+                    std::process::exit(1);
+                }
+            }));
+            return;
+        }
+        _ => {
+            panic::set_hook(Box::new(panic_hook));
+        }
     }
 
     let exe = env::current_exe().expect("unable to find ourselves");
@@ -53,13 +70,13 @@ pub async fn init(crash_init: InitCrashHandler) {
     // used by the crash handler isn't destroyed correctly which causes it to stay on the file
     // system and block further attempts to initialize crash handlers with that socket path.
     let socket_name = paths::temp_dir().join(format!("zed-crash-handler-{zed_pid}"));
-    #[allow(unused)]
-    let server_pid = Command::new(exe)
+    let _crash_handler = Command::new(exe)
         .arg("--crash-handler")
         .arg(&socket_name)
         .spawn()
-        .expect("unable to spawn server process")
-        .id();
+        .expect("unable to spawn server process");
+    #[cfg(target_os = "linux")]
+    let server_pid = _crash_handler.id();
     info!("spawning crash handler process");
 
     let mut elapsed = Duration::ZERO;
@@ -91,7 +108,10 @@ pub async fn init(crash_init: InitCrashHandler) {
                 #[cfg(target_os = "macos")]
                 suspend_all_other_threads();
 
-                client.ping().unwrap();
+                // on macos this "ping" is needed to ensure that all our
+                // `client.send_message` calls have been processed before we trigger the
+                // minidump request.
+                client.ping().ok();
                 client.request_dump(crash_context).is_ok()
             } else {
                 true
@@ -153,6 +173,7 @@ pub struct CrashInfo {
 pub struct InitCrashHandler {
     pub session_id: String,
     pub zed_version: String,
+    pub binary: String,
     pub release_channel: String,
     pub commit_sha: String,
 }
@@ -246,9 +267,10 @@ impl minidumper::ServerHandler for CrashServer {
             3 => {
                 let gpu_specs: system_specs::GpuSpecs =
                     bincode::deserialize(&buffer).expect("gpu specs");
-                self.active_gpu
-                    .set(gpu_specs)
-                    .expect("already set active gpu");
+                // we ignore the case where it was already set because this message is sent
+                // on each new window. in theory all zed windows should be using the same
+                // GPU so this is fine.
+                self.active_gpu.set(gpu_specs).ok();
             }
             _ => {
                 panic!("invalid message kind");
@@ -267,23 +289,31 @@ impl minidumper::ServerHandler for CrashServer {
 }
 
 pub fn panic_hook(info: &PanicHookInfo) {
-    let message = info
-        .payload()
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| info.payload().downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "Box<Any>".to_string());
+    // Don't handle a panic on threads that are not relevant to the main execution.
+    if extension_host::wasm_host::IS_WASM_THREAD.with(|v| v.load(Ordering::Acquire)) {
+        log::error!("wasm thread panicked!");
+        return;
+    }
+
+    let message = info.payload_as_str().unwrap_or("Box<Any>").to_owned();
 
     let span = info
         .location()
         .map(|loc| format!("{}:{}", loc.file(), loc.line()))
         .unwrap_or_default();
 
+    let current_thread = std::thread::current();
+    let thread_name = current_thread.name().unwrap_or("<unnamed>");
+
     // wait 500ms for the crash handler process to start up
     // if it's still not there just write panic info and no minidump
     let retry_frequency = Duration::from_millis(100);
     for _ in 0..5 {
         if let Some(client) = CRASH_HANDLER.get() {
+            let location = info
+                .location()
+                .map_or_else(|| "<unknown>".to_owned(), |location| location.to_string());
+            log::error!("thread '{thread_name}' panicked at {location}:\n{message}...");
             client
                 .send_message(
                     2,
@@ -321,16 +351,19 @@ pub fn crash_server(socket: &Path) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let has_connection = Arc::new(AtomicBool::new(false));
 
-    std::thread::spawn({
-        let shutdown = shutdown.clone();
-        let has_connection = has_connection.clone();
-        move || {
-            std::thread::sleep(CRASH_HANDLER_CONNECT_TIMEOUT);
-            if !has_connection.load(Ordering::SeqCst) {
-                shutdown.store(true, Ordering::SeqCst);
+    thread::Builder::new()
+        .name("CrashServerTimeout".to_owned())
+        .spawn({
+            let shutdown = shutdown.clone();
+            let has_connection = has_connection.clone();
+            move || {
+                std::thread::sleep(CRASH_HANDLER_CONNECT_TIMEOUT);
+                if !has_connection.load(Ordering::SeqCst) {
+                    shutdown.store(true, Ordering::SeqCst);
+                }
             }
-        }
-    });
+        })
+        .unwrap();
 
     server
         .run(

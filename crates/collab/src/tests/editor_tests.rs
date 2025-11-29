@@ -4,10 +4,12 @@ use crate::{
 };
 use call::ActiveCall;
 use editor::{
-    DocumentColorsRenderMode, Editor, EditorSettings, RowInfo, SelectionEffects,
+    DocumentColorsRenderMode, Editor, FETCH_COLORS_DEBOUNCE_TIMEOUT, MultiBufferOffset, RowInfo,
+    SelectionEffects,
     actions::{
-        ConfirmCodeAction, ConfirmCompletion, ConfirmRename, ContextMenuFirst,
-        ExpandMacroRecursively, MoveToEnd, Redo, Rename, SelectAll, ToggleCodeActions, Undo,
+        ConfirmCodeAction, ConfirmCompletion, ConfirmRename, ContextMenuFirst, CopyFileLocation,
+        CopyFileName, CopyFileNameWithoutExtension, ExpandMacroRecursively, MoveToEnd, Redo,
+        Rename, SelectAll, ToggleCodeActions, Undo,
     },
     test::{
         editor_test_context::{AssertionContextManager, EditorTestContext},
@@ -16,22 +18,21 @@ use editor::{
 };
 use fs::Fs;
 use futures::{SinkExt, StreamExt, channel::mpsc, lock::Mutex};
-use gpui::{App, Rgba, TestAppContext, UpdateGlobal, VisualContext, VisualTestContext};
-use indoc::indoc;
-use language::{
-    FakeLspAdapter,
-    language_settings::{AllLanguageSettings, InlayHintSettings},
+use git::repository::repo_path;
+use gpui::{
+    App, Rgba, SharedString, TestAppContext, UpdateGlobal, VisualContext, VisualTestContext,
 };
+use indoc::indoc;
+use language::FakeLspAdapter;
 use lsp::LSP_REQUEST_TIMEOUT;
 use project::{
-    ProjectPath, SERVER_PROGRESS_THROTTLE_TIMEOUT,
+    ProgressToken, ProjectPath, SERVER_PROGRESS_THROTTLE_TIMEOUT,
     lsp_store::lsp_ext_command::{ExpandedMacro, LspExtExpandMacro},
-    project_settings::{InlineBlameSettings, ProjectSettings},
 };
 use recent_projects::disconnected_overlay::DisconnectedOverlay;
 use rpc::RECEIVE_TIMEOUT;
 use serde_json::json;
-use settings::SettingsStore;
+use settings::{InlayHintSettingsContent, InlineBlameSettings, SettingsStore};
 use std::{
     collections::BTreeSet,
     ops::{Deref as _, Range},
@@ -40,9 +41,10 @@ use std::{
         Arc,
         atomic::{self, AtomicBool, AtomicUsize},
     },
+    time::Duration,
 };
 use text::Point;
-use util::{path, uri};
+use util::{path, rel_path::rel_path, uri};
 use workspace::{CloseIntent, Workspace};
 
 #[gpui::test(iterations = 10)]
@@ -101,7 +103,7 @@ async fn test_host_disconnect(
 
     let editor_b = workspace_b
         .update(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "b.txt"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("b.txt")), None, true, window, cx)
         })
         .unwrap()
         .await
@@ -209,7 +211,9 @@ async fn test_newline_above_or_below_does_not_move_guest_cursor(
 
     // Open a buffer as client A
     let buffer_a = project_a
-        .update(cx_a, |p, cx| p.open_buffer((worktree_id, "a.txt"), cx))
+        .update(cx_a, |p, cx| {
+            p.open_buffer((worktree_id, rel_path("a.txt")), cx)
+        })
         .await
         .unwrap();
     let cx_a = cx_a.add_empty_window();
@@ -226,7 +230,9 @@ async fn test_newline_above_or_below_does_not_move_guest_cursor(
     let cx_b = cx_b.add_empty_window();
     // Open a buffer as client B
     let buffer_b = project_b
-        .update(cx_b, |p, cx| p.open_buffer((worktree_id, "a.txt"), cx))
+        .update(cx_b, |p, cx| {
+            p.open_buffer((worktree_id, rel_path("a.txt")), cx)
+        })
         .await
         .unwrap();
     let editor_b = cx_b
@@ -284,7 +290,7 @@ async fn test_newline_above_or_below_does_not_move_guest_cursor(
     "});
 }
 
-#[gpui::test(iterations = 10)]
+#[gpui::test]
 async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mut TestAppContext) {
     let mut server = TestServer::start(cx_a.executor()).await;
     let client_a = server.create_client(cx_a, "user_a").await;
@@ -303,17 +309,35 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
         ..lsp::ServerCapabilities::default()
     };
     client_a.language_registry().add(rust_lang());
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
+    let mut fake_language_servers = [
+        client_a.language_registry().register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                capabilities: capabilities.clone(),
+                ..FakeLspAdapter::default()
+            },
+        ),
+        client_a.language_registry().register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                name: "fake-analyzer",
+                capabilities: capabilities.clone(),
+                ..FakeLspAdapter::default()
+            },
+        ),
+    ];
+    client_b.language_registry().add(rust_lang());
+    client_b.language_registry().register_fake_lsp_adapter(
         "Rust",
         FakeLspAdapter {
             capabilities: capabilities.clone(),
             ..FakeLspAdapter::default()
         },
     );
-    client_b.language_registry().add(rust_lang());
     client_b.language_registry().register_fake_lsp_adapter(
         "Rust",
         FakeLspAdapter {
+            name: "fake-analyzer",
             capabilities,
             ..FakeLspAdapter::default()
         },
@@ -338,7 +362,9 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
 
     // Open a file in an editor as the guest.
     let buffer_b = project_b
-        .update(cx_b, |p, cx| p.open_buffer((worktree_id, "main.rs"), cx))
+        .update(cx_b, |p, cx| {
+            p.open_buffer((worktree_id, rel_path("main.rs")), cx)
+        })
         .await
         .unwrap();
     let cx_b = cx_b.add_empty_window();
@@ -346,7 +372,8 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
         Editor::for_buffer(buffer_b.clone(), Some(project_b.clone()), window, cx)
     });
 
-    let fake_language_server = fake_language_servers.next().await.unwrap();
+    let fake_language_server = fake_language_servers[0].next().await.unwrap();
+    let second_fake_language_server = fake_language_servers[1].next().await.unwrap();
     cx_a.background_executor.run_until_parked();
 
     buffer_b.read_with(cx_b, |buffer, _| {
@@ -356,7 +383,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
     // Type a completion trigger character as the guest.
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13])
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)])
         });
         editor.handle_input(".", window, cx);
     });
@@ -408,11 +435,18 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
         .next()
         .await
         .unwrap();
+    second_fake_language_server
+        .set_request_handler::<lsp::request::Completion, _, _>(|_, _| async move { Ok(None) })
+        .next()
+        .await
+        .unwrap();
     cx_a.executor().finish_waiting();
 
     // Open the buffer on the host.
     let buffer_a = project_a
-        .update(cx_a, |p, cx| p.open_buffer((worktree_id, "main.rs"), cx))
+        .update(cx_a, |p, cx| {
+            p.open_buffer((worktree_id, rel_path("main.rs")), cx)
+        })
         .await
         .unwrap();
     cx_a.executor().run_until_parked();
@@ -471,7 +505,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
     // resolved
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([46..46])
+            s.select_ranges([MultiBufferOffset(46)..MultiBufferOffset(46)])
         });
         editor.handle_input("; a", window, cx);
         editor.handle_input(".", window, cx);
@@ -500,7 +534,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
                     label: "third_method(…)".into(),
                     detail: Some("fn(&mut self, B, C, D) -> E".into()),
                     text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
-                        // no snippet placehodlers
+                        // no snippet placeholders
                         new_text: "third_method".to_string(),
                         range: lsp::Range::new(
                             lsp::Position::new(1, 32),
@@ -513,6 +547,10 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
                 },
             ])))
         });
+
+    // Second language server also needs to handle the request (returns None)
+    let mut second_completion_response = second_fake_language_server
+        .set_request_handler::<lsp::request::Completion, _, _>(|_, _| async move { Ok(None) });
 
     // The completion now gets a new `text_edit.new_text` when resolving the completion item
     let mut resolve_completion_response = fake_language_server
@@ -537,6 +575,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
     cx_b.executor().run_until_parked();
 
     completion_response.next().await.unwrap();
+    second_completion_response.next().await.unwrap();
 
     editor_b.update_in(cx_b, |editor, window, cx| {
         assert!(editor.context_menu_visible());
@@ -553,6 +592,77 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
         assert_eq!(
             editor.text(cx),
             "use d::SomeTrait;\nfn main() { a.first_method(); a.third_method(, , ) }"
+        );
+    });
+
+    // Ensure buffer is synced before proceeding with the next test
+    cx_a.executor().run_until_parked();
+    cx_b.executor().run_until_parked();
+
+    // Test completions from the second fake language server
+    // Add another completion trigger to test the second language server
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+            s.select_ranges([MultiBufferOffset(68)..MultiBufferOffset(68)])
+        });
+        editor.handle_input("; b", window, cx);
+        editor.handle_input(".", window, cx);
+    });
+
+    buffer_b.read_with(cx_b, |buffer, _| {
+        assert_eq!(
+            buffer.text(),
+            "use d::SomeTrait;\nfn main() { a.first_method(); a.third_method(, , ); b. }"
+        );
+    });
+
+    // Set up completion handlers for both language servers
+    let mut first_lsp_completion = fake_language_server
+        .set_request_handler::<lsp::request::Completion, _, _>(|_, _| async move { Ok(None) });
+
+    let mut second_lsp_completion = second_fake_language_server
+        .set_request_handler::<lsp::request::Completion, _, _>(|params, _| async move {
+            assert_eq!(
+                params.text_document_position.text_document.uri,
+                lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
+            );
+            assert_eq!(
+                params.text_document_position.position,
+                lsp::Position::new(1, 54),
+            );
+
+            Ok(Some(lsp::CompletionResponse::Array(vec![
+                lsp::CompletionItem {
+                    label: "analyzer_method(…)".into(),
+                    detail: Some("fn(&self) -> Result<T>".into()),
+                    text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+                        new_text: "analyzer_method()".to_string(),
+                        range: lsp::Range::new(
+                            lsp::Position::new(1, 54),
+                            lsp::Position::new(1, 54),
+                        ),
+                    })),
+                    insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
+                    ..Default::default()
+                },
+            ])))
+        });
+
+    cx_b.executor().run_until_parked();
+
+    // Await both language server responses
+    first_lsp_completion.next().await.unwrap();
+    second_lsp_completion.next().await.unwrap();
+
+    cx_b.executor().run_until_parked();
+
+    // Confirm the completion from the second language server works
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        assert!(editor.context_menu_visible());
+        editor.confirm_completion(&ConfirmCompletion { item_ix: Some(0) }, window, cx);
+        assert_eq!(
+            editor.text(cx),
+            "use d::SomeTrait;\nfn main() { a.first_method(); a.third_method(, , ); b.analyzer_method() }"
         );
     });
 }
@@ -603,7 +713,7 @@ async fn test_collaborating_with_code_actions(
     let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
     let editor_b = workspace_b
         .update_in(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "main.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -829,7 +939,7 @@ async fn test_collaborating_with_renames(cx_a: &mut TestAppContext, cx_b: &mut T
     let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
     let editor_b = workspace_b
         .update_in(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "one.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("one.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -842,7 +952,7 @@ async fn test_collaborating_with_renames(cx_a: &mut TestAppContext, cx_b: &mut T
     // Move cursor to a location that can be renamed.
     let prepare_rename = editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([7..7])
+            s.select_ranges([MultiBufferOffset(7)..MultiBufferOffset(7)])
         });
         editor.rename(&Rename, window, cx).unwrap()
     });
@@ -869,17 +979,17 @@ async fn test_collaborating_with_renames(cx_a: &mut TestAppContext, cx_b: &mut T
         let buffer = editor.buffer().read(cx).snapshot(cx);
         assert_eq!(
             rename.range.start.to_offset(&buffer)..rename.range.end.to_offset(&buffer),
-            6..9
+            MultiBufferOffset(6)..MultiBufferOffset(9)
         );
         rename.editor.update(cx, |rename_editor, cx| {
-            let rename_selection = rename_editor.selections.newest::<usize>(cx);
+            let rename_selection = rename_editor.selections.newest::<MultiBufferOffset>(&rename_editor.display_snapshot(cx));
             assert_eq!(
                 rename_selection.range(),
-                0..3,
+                MultiBufferOffset(0)..MultiBufferOffset(3),
                 "Rename that was triggered from zero selection caret, should propose the whole word."
             );
             rename_editor.buffer().update(cx, |rename_buffer, cx| {
-                rename_buffer.edit([(0..3, "THREE")], None, cx);
+                rename_buffer.edit([(MultiBufferOffset(0)..MultiBufferOffset(3), "THREE")], None, cx);
             });
         });
     });
@@ -890,7 +1000,7 @@ async fn test_collaborating_with_renames(cx_a: &mut TestAppContext, cx_b: &mut T
     });
     let prepare_rename = editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([7..8])
+            s.select_ranges([MultiBufferOffset(7)..MultiBufferOffset(8)])
         });
         editor.rename(&Rename, window, cx).unwrap()
     });
@@ -917,16 +1027,16 @@ async fn test_collaborating_with_renames(cx_a: &mut TestAppContext, cx_b: &mut T
         let buffer = editor.buffer().read(cx).snapshot(cx);
         let lsp_rename_start = rename.range.start.to_offset(&buffer);
         let lsp_rename_end = rename.range.end.to_offset(&buffer);
-        assert_eq!(lsp_rename_start..lsp_rename_end, 6..9);
+        assert_eq!(lsp_rename_start..lsp_rename_end, MultiBufferOffset(6)..MultiBufferOffset(9));
         rename.editor.update(cx, |rename_editor, cx| {
-            let rename_selection = rename_editor.selections.newest::<usize>(cx);
+            let rename_selection = rename_editor.selections.newest::<MultiBufferOffset>(&rename_editor.display_snapshot(cx));
             assert_eq!(
                 rename_selection.range(),
-                1..2,
+                MultiBufferOffset(1)..MultiBufferOffset(2),
                 "Rename that was triggered from a selection, should have the same selection range in the rename proposal"
             );
             rename_editor.buffer().update(cx, |rename_buffer, cx| {
-                rename_buffer.edit([(0..lsp_rename_end - lsp_rename_start, "THREE")], None, cx);
+                rename_buffer.edit([(MultiBufferOffset(0)..MultiBufferOffset(lsp_rename_end - lsp_rename_start), "THREE")], None, cx);
             });
         });
     });
@@ -1076,7 +1186,7 @@ async fn test_slow_lsp_server(cx_a: &mut TestAppContext, cx_b: &mut TestAppConte
     let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
     let editor_b = workspace_b
         .update_in(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "one.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("one.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -1129,7 +1239,7 @@ async fn test_slow_lsp_server(cx_a: &mut TestAppContext, cx_b: &mut TestAppConte
     // Move cursor to a location, this should trigger the code lens call.
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([7..7])
+            s.select_ranges([MultiBufferOffset(7)..MultiBufferOffset(7)])
         });
     });
     let () = request_started_rx.next().await.unwrap();
@@ -1151,7 +1261,7 @@ async fn test_slow_lsp_server(cx_a: &mut TestAppContext, cx_b: &mut TestAppConte
 
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([1..1])
+            s.select_ranges([MultiBufferOffset(1)..MultiBufferOffset(1)])
         });
     });
     let () = request_started_rx.next().await.unwrap();
@@ -1173,7 +1283,7 @@ async fn test_slow_lsp_server(cx_a: &mut TestAppContext, cx_b: &mut TestAppConte
 
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([2..2])
+            s.select_ranges([MultiBufferOffset(2)..MultiBufferOffset(2)])
         });
     });
     let () = request_started_rx.next().await.unwrap();
@@ -1267,7 +1377,7 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
     fake_language_server.start_progress("the-token").await;
 
     executor.advance_clock(SERVER_PROGRESS_THROTTLE_TIMEOUT);
-    fake_language_server.notify::<lsp::notification::Progress>(&lsp::ProgressParams {
+    fake_language_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
         token: lsp::NumberOrString::String("the-token".to_string()),
         value: lsp::ProgressParamsValue::WorkDone(lsp::WorkDoneProgress::Report(
             lsp::WorkDoneProgressReport {
@@ -1278,12 +1388,14 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
     });
     executor.run_until_parked();
 
+    let token = ProgressToken::String(SharedString::from("the-token"));
+
     project_a.read_with(cx_a, |project, cx| {
         let status = project.language_server_statuses(cx).next().unwrap().1;
         assert_eq!(status.name.0, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
-            status.pending_work["the-token"].message.as_ref().unwrap(),
+            status.pending_work[&token].message.as_ref().unwrap(),
             "the-message"
         );
     });
@@ -1301,7 +1413,7 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
     });
 
     executor.advance_clock(SERVER_PROGRESS_THROTTLE_TIMEOUT);
-    fake_language_server.notify::<lsp::notification::Progress>(&lsp::ProgressParams {
+    fake_language_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
         token: lsp::NumberOrString::String("the-token".to_string()),
         value: lsp::ProgressParamsValue::WorkDone(lsp::WorkDoneProgress::Report(
             lsp::WorkDoneProgressReport {
@@ -1317,7 +1429,7 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
         assert_eq!(status.name.0, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
-            status.pending_work["the-token"].message.as_ref().unwrap(),
+            status.pending_work[&token].message.as_ref().unwrap(),
             "the-message-2"
         );
     });
@@ -1327,7 +1439,7 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
         assert_eq!(status.name.0, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
-            status.pending_work["the-token"].message.as_ref().unwrap(),
+            status.pending_work[&token].message.as_ref().unwrap(),
             "the-message-2"
         );
     });
@@ -1403,12 +1515,12 @@ async fn test_share_project(
     project_b.read_with(cx_b, |project, cx| {
         let worktree = project.worktrees(cx).next().unwrap().read(cx);
         assert_eq!(
-            worktree.paths().map(AsRef::as_ref).collect::<Vec<_>>(),
+            worktree.paths().collect::<Vec<_>>(),
             [
-                Path::new(".gitignore"),
-                Path::new("a.txt"),
-                Path::new("b.txt"),
-                Path::new("ignored-dir"),
+                rel_path(".gitignore"),
+                rel_path("a.txt"),
+                rel_path("b.txt"),
+                rel_path("ignored-dir"),
             ]
         );
     });
@@ -1416,7 +1528,10 @@ async fn test_share_project(
     project_b
         .update(cx_b, |project, cx| {
             let worktree = project.worktrees(cx).next().unwrap();
-            let entry = worktree.read(cx).entry_for_path("ignored-dir").unwrap();
+            let entry = worktree
+                .read(cx)
+                .entry_for_path(rel_path("ignored-dir"))
+                .unwrap();
             project.expand_entry(worktree_id, entry.id, cx).unwrap()
         })
         .await
@@ -1425,31 +1540,35 @@ async fn test_share_project(
     project_b.read_with(cx_b, |project, cx| {
         let worktree = project.worktrees(cx).next().unwrap().read(cx);
         assert_eq!(
-            worktree.paths().map(AsRef::as_ref).collect::<Vec<_>>(),
+            worktree.paths().collect::<Vec<_>>(),
             [
-                Path::new(".gitignore"),
-                Path::new("a.txt"),
-                Path::new("b.txt"),
-                Path::new("ignored-dir"),
-                Path::new("ignored-dir/c.txt"),
-                Path::new("ignored-dir/d.txt"),
+                rel_path(".gitignore"),
+                rel_path("a.txt"),
+                rel_path("b.txt"),
+                rel_path("ignored-dir"),
+                rel_path("ignored-dir/c.txt"),
+                rel_path("ignored-dir/d.txt"),
             ]
         );
     });
 
     // Open the same file as client B and client A.
     let buffer_b = project_b
-        .update(cx_b, |p, cx| p.open_buffer((worktree_id, "b.txt"), cx))
+        .update(cx_b, |p, cx| {
+            p.open_buffer((worktree_id, rel_path("b.txt")), cx)
+        })
         .await
         .unwrap();
 
     buffer_b.read_with(cx_b, |buf, _| assert_eq!(buf.text(), "b-contents"));
 
     project_a.read_with(cx_a, |project, cx| {
-        assert!(project.has_open_buffer((worktree_id, "b.txt"), cx))
+        assert!(project.has_open_buffer((worktree_id, rel_path("b.txt")), cx))
     });
     let buffer_a = project_a
-        .update(cx_a, |p, cx| p.open_buffer((worktree_id, "b.txt"), cx))
+        .update(cx_a, |p, cx| {
+            p.open_buffer((worktree_id, rel_path("b.txt")), cx)
+        })
         .await
         .unwrap();
 
@@ -1462,7 +1581,10 @@ async fn test_share_project(
     buffer_a.read_with(cx_a, |buffer, _| {
         buffer
             .snapshot()
-            .selections_in_range(text::Anchor::MIN..text::Anchor::MAX, false)
+            .selections_in_range(
+                text::Anchor::min_max_range_for_buffer(buffer.remote_id()),
+                false,
+            )
             .count()
             == 1
     });
@@ -1503,7 +1625,10 @@ async fn test_share_project(
     buffer_a.read_with(cx_a, |buffer, _| {
         buffer
             .snapshot()
-            .selections_in_range(text::Anchor::MIN..text::Anchor::MAX, false)
+            .selections_in_range(
+                text::Anchor::min_max_range_for_buffer(buffer.remote_id()),
+                false,
+            )
             .count()
             == 0
     });
@@ -1557,7 +1682,9 @@ async fn test_on_input_format_from_host_to_guest(
 
     // Open a file in an editor as the host.
     let buffer_a = project_a
-        .update(cx_a, |p, cx| p.open_buffer((worktree_id, "main.rs"), cx))
+        .update(cx_a, |p, cx| {
+            p.open_buffer((worktree_id, rel_path("main.rs")), cx)
+        })
         .await
         .unwrap();
     let cx_a = cx_a.add_empty_window();
@@ -1590,7 +1717,9 @@ async fn test_on_input_format_from_host_to_guest(
 
     // Open the buffer on the guest and see that the formatting worked
     let buffer_b = project_b
-        .update(cx_b, |p, cx| p.open_buffer((worktree_id, "main.rs"), cx))
+        .update(cx_b, |p, cx| {
+            p.open_buffer((worktree_id, rel_path("main.rs")), cx)
+        })
         .await
         .unwrap();
 
@@ -1598,7 +1727,7 @@ async fn test_on_input_format_from_host_to_guest(
     cx_a.focus(&editor_a);
     editor_a.update_in(cx_a, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13])
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)])
         });
         editor.handle_input(">", window, cx);
     });
@@ -1690,7 +1819,9 @@ async fn test_on_input_format_from_guest_to_host(
 
     // Open a file in an editor as the guest.
     let buffer_b = project_b
-        .update(cx_b, |p, cx| p.open_buffer((worktree_id, "main.rs"), cx))
+        .update(cx_b, |p, cx| {
+            p.open_buffer((worktree_id, rel_path("main.rs")), cx)
+        })
         .await
         .unwrap();
     let cx_b = cx_b.add_empty_window();
@@ -1705,7 +1836,7 @@ async fn test_on_input_format_from_guest_to_host(
     cx_b.focus(&editor_b);
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13])
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)])
         });
         editor.handle_input(":", window, cx);
     });
@@ -1736,7 +1867,9 @@ async fn test_on_input_format_from_guest_to_host(
 
     // Open the buffer on the host and see that the formatting worked
     let buffer_a = project_a
-        .update(cx_a, |p, cx| p.open_buffer((worktree_id, "main.rs"), cx))
+        .update(cx_a, |p, cx| {
+            p.open_buffer((worktree_id, rel_path("main.rs")), cx)
+        })
         .await
         .unwrap();
     executor.run_until_parked();
@@ -1789,35 +1922,23 @@ async fn test_mutual_editor_inlay_hint_cache_update(
 
     cx_a.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<AllLanguageSettings>(cx, |settings| {
-                settings.defaults.inlay_hints = Some(InlayHintSettings {
-                    enabled: true,
-                    show_value_hints: true,
-                    edit_debounce_ms: 0,
-                    scroll_debounce_ms: 0,
-                    show_type_hints: true,
-                    show_parameter_hints: false,
-                    show_other_hints: true,
-                    show_background: false,
-                    toggle_on_modifiers_press: None,
-                })
+            store.update_user_settings(cx, |settings| {
+                settings.project.all_languages.defaults.inlay_hints =
+                    Some(InlayHintSettingsContent {
+                        enabled: Some(true),
+                        ..InlayHintSettingsContent::default()
+                    })
             });
         });
     });
     cx_b.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<AllLanguageSettings>(cx, |settings| {
-                settings.defaults.inlay_hints = Some(InlayHintSettings {
-                    show_value_hints: true,
-                    enabled: true,
-                    edit_debounce_ms: 0,
-                    scroll_debounce_ms: 0,
-                    show_type_hints: true,
-                    show_parameter_hints: false,
-                    show_other_hints: true,
-                    show_background: false,
-                    toggle_on_modifiers_press: None,
-                })
+            store.update_user_settings(cx, |settings| {
+                settings.project.all_languages.defaults.inlay_hints =
+                    Some(InlayHintSettingsContent {
+                        enabled: Some(true),
+                        ..InlayHintSettingsContent::default()
+                    })
             });
         });
     });
@@ -1827,10 +1948,40 @@ async fn test_mutual_editor_inlay_hint_cache_update(
         ..lsp::ServerCapabilities::default()
     };
     client_a.language_registry().add(rust_lang());
+
+    // Set up the language server to return an additional inlay hint on each request.
+    let edits_made = Arc::new(AtomicUsize::new(0));
+    let closure_edits_made = Arc::clone(&edits_made);
     let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             capabilities: capabilities.clone(),
+            initializer: Some(Box::new(move |fake_language_server| {
+                let closure_edits_made = closure_edits_made.clone();
+                fake_language_server.set_request_handler::<lsp::request::InlayHintRequest, _, _>(
+                    move |params, _| {
+                        let edits_made_2 = Arc::clone(&closure_edits_made);
+                        async move {
+                            assert_eq!(
+                                params.text_document.uri,
+                                lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
+                            );
+                            let edits_made =
+                                AtomicUsize::load(&edits_made_2, atomic::Ordering::Acquire);
+                            Ok(Some(vec![lsp::InlayHint {
+                                position: lsp::Position::new(0, edits_made as u32),
+                                label: lsp::InlayHintLabel::String(edits_made.to_string()),
+                                kind: None,
+                                text_edits: None,
+                                tooltip: None,
+                                padding_left: None,
+                                padding_right: None,
+                                data: None,
+                            }]))
+                        }
+                    },
+                );
+            })),
             ..FakeLspAdapter::default()
         },
     );
@@ -1872,79 +2023,40 @@ async fn test_mutual_editor_inlay_hint_cache_update(
         .unwrap();
 
     let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
-    executor.start_waiting();
 
     // The host opens a rust file.
-    let _buffer_a = project_a
-        .update(cx_a, |project, cx| {
-            project.open_local_buffer(path!("/a/main.rs"), cx)
-        })
-        .await
-        .unwrap();
-    let editor_a = workspace_a
-        .update_in(cx_a, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "main.rs"), None, true, window, cx)
-        })
-        .await
-        .unwrap()
-        .downcast::<Editor>()
-        .unwrap();
-
+    let file_a = workspace_a.update_in(cx_a, |workspace, window, cx| {
+        workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
+    });
     let fake_language_server = fake_language_servers.next().await.unwrap();
-
-    // Set up the language server to return an additional inlay hint on each request.
-    let edits_made = Arc::new(AtomicUsize::new(0));
-    let closure_edits_made = Arc::clone(&edits_made);
-    fake_language_server
-        .set_request_handler::<lsp::request::InlayHintRequest, _, _>(move |params, _| {
-            let task_edits_made = Arc::clone(&closure_edits_made);
-            async move {
-                assert_eq!(
-                    params.text_document.uri,
-                    lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
-                );
-                let edits_made = task_edits_made.load(atomic::Ordering::Acquire);
-                Ok(Some(vec![lsp::InlayHint {
-                    position: lsp::Position::new(0, edits_made as u32),
-                    label: lsp::InlayHintLabel::String(edits_made.to_string()),
-                    kind: None,
-                    text_edits: None,
-                    tooltip: None,
-                    padding_left: None,
-                    padding_right: None,
-                    data: None,
-                }]))
-            }
-        })
-        .next()
-        .await
-        .unwrap();
-
+    let editor_a = file_a.await.unwrap().downcast::<Editor>().unwrap();
+    executor.advance_clock(Duration::from_millis(100));
     executor.run_until_parked();
 
     let initial_edit = edits_made.load(atomic::Ordering::Acquire);
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert_eq!(
             vec![initial_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Host should get its first hints when opens an editor"
         );
     });
     let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
     let editor_b = workspace_b
         .update_in(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "main.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
         .downcast::<Editor>()
         .unwrap();
 
+    executor.advance_clock(Duration::from_millis(100));
     executor.run_until_parked();
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec![initial_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Client should get its first hints when opens an editor"
         );
     });
@@ -1952,46 +2064,48 @@ async fn test_mutual_editor_inlay_hint_cache_update(
     let after_client_edit = edits_made.fetch_add(1, atomic::Ordering::Release) + 1;
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13].clone())
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)].clone())
         });
         editor.handle_input(":", window, cx);
     });
     cx_b.focus(&editor_b);
 
+    executor.advance_clock(Duration::from_secs(1));
     executor.run_until_parked();
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert_eq!(
             vec![after_client_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
         );
     });
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec![after_client_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
         );
     });
 
     let after_host_edit = edits_made.fetch_add(1, atomic::Ordering::Release) + 1;
     editor_a.update_in(cx_a, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13])
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)])
         });
         editor.handle_input("a change to increment both buffers' versions", window, cx);
     });
     cx_a.focus(&editor_a);
 
+    executor.advance_clock(Duration::from_secs(1));
     executor.run_until_parked();
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert_eq!(
             vec![after_host_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
         );
     });
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec![after_host_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
         );
     });
 
@@ -2002,18 +2116,19 @@ async fn test_mutual_editor_inlay_hint_cache_update(
         .into_response()
         .expect("inlay refresh request failed");
 
+    executor.advance_clock(Duration::from_secs(1));
     executor.run_until_parked();
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert_eq!(
             vec![after_special_edit_for_refresh.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Host should react to /refresh LSP request"
         );
     });
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec![after_special_edit_for_refresh.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Guest should get a /refresh LSP request propagated by host"
         );
     });
@@ -2039,35 +2154,37 @@ async fn test_inlay_hint_refresh_is_forwarded(
 
     cx_a.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<AllLanguageSettings>(cx, |settings| {
-                settings.defaults.inlay_hints = Some(InlayHintSettings {
-                    show_value_hints: true,
-                    enabled: false,
-                    edit_debounce_ms: 0,
-                    scroll_debounce_ms: 0,
-                    show_type_hints: false,
-                    show_parameter_hints: false,
-                    show_other_hints: false,
-                    show_background: false,
-                    toggle_on_modifiers_press: None,
-                })
+            store.update_user_settings(cx, |settings| {
+                settings.project.all_languages.defaults.inlay_hints =
+                    Some(InlayHintSettingsContent {
+                        show_value_hints: Some(true),
+                        enabled: Some(false),
+                        edit_debounce_ms: Some(0),
+                        scroll_debounce_ms: Some(0),
+                        show_type_hints: Some(false),
+                        show_parameter_hints: Some(false),
+                        show_other_hints: Some(false),
+                        show_background: Some(false),
+                        toggle_on_modifiers_press: None,
+                    })
             });
         });
     });
     cx_b.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<AllLanguageSettings>(cx, |settings| {
-                settings.defaults.inlay_hints = Some(InlayHintSettings {
-                    show_value_hints: true,
-                    enabled: true,
-                    edit_debounce_ms: 0,
-                    scroll_debounce_ms: 0,
-                    show_type_hints: true,
-                    show_parameter_hints: true,
-                    show_other_hints: true,
-                    show_background: false,
-                    toggle_on_modifiers_press: None,
-                })
+            store.update_user_settings(cx, |settings| {
+                settings.project.all_languages.defaults.inlay_hints =
+                    Some(InlayHintSettingsContent {
+                        show_value_hints: Some(true),
+                        enabled: Some(true),
+                        edit_debounce_ms: Some(0),
+                        scroll_debounce_ms: Some(0),
+                        show_type_hints: Some(true),
+                        show_parameter_hints: Some(true),
+                        show_other_hints: Some(true),
+                        show_background: Some(false),
+                        toggle_on_modifiers_press: None,
+                    })
             });
         });
     });
@@ -2126,7 +2243,7 @@ async fn test_inlay_hint_refresh_is_forwarded(
 
     let editor_a = workspace_a
         .update_in(cx_a, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "main.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -2135,7 +2252,7 @@ async fn test_inlay_hint_refresh_is_forwarded(
 
     let editor_b = workspace_b
         .update_in(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "main.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -2160,16 +2277,28 @@ async fn test_inlay_hint_refresh_is_forwarded(
                 } else {
                     "initial hint"
                 };
-                Ok(Some(vec![lsp::InlayHint {
-                    position: lsp::Position::new(0, character),
-                    label: lsp::InlayHintLabel::String(label.to_string()),
-                    kind: None,
-                    text_edits: None,
-                    tooltip: None,
-                    padding_left: None,
-                    padding_right: None,
-                    data: None,
-                }]))
+                Ok(Some(vec![
+                    lsp::InlayHint {
+                        position: lsp::Position::new(0, character),
+                        label: lsp::InlayHintLabel::String(label.to_string()),
+                        kind: None,
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: None,
+                        padding_right: None,
+                        data: None,
+                    },
+                    lsp::InlayHint {
+                        position: lsp::Position::new(1090, 1090),
+                        label: lsp::InlayHintLabel::String("out-of-bounds hint".to_string()),
+                        kind: None,
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: None,
+                        padding_right: None,
+                        data: None,
+                    },
+                ]))
             }
         })
         .next()
@@ -2178,18 +2307,18 @@ async fn test_inlay_hint_refresh_is_forwarded(
     executor.finish_waiting();
 
     executor.run_until_parked();
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert!(
-            extract_hint_labels(editor).is_empty(),
+            extract_hint_labels(editor, cx).is_empty(),
             "Host should get no hints due to them turned off"
         );
     });
 
     executor.run_until_parked();
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec!["initial hint".to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Client should get its first hints when opens an editor"
         );
     });
@@ -2201,18 +2330,18 @@ async fn test_inlay_hint_refresh_is_forwarded(
         .into_response()
         .expect("inlay refresh request failed");
     executor.run_until_parked();
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert!(
-            extract_hint_labels(editor).is_empty(),
+            extract_hint_labels(editor, cx).is_empty(),
             "Host should get no hints due to them turned off, even after the /refresh"
         );
     });
 
     executor.run_until_parked();
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec!["other hint".to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Guest should get a /refresh LSP request propagated by host despite host hints are off"
         );
     });
@@ -2241,15 +2370,15 @@ async fn test_lsp_document_color(cx_a: &mut TestAppContext, cx_b: &mut TestAppCo
 
     cx_a.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |settings| {
-                settings.lsp_document_colors = Some(DocumentColorsRenderMode::None);
+            store.update_user_settings(cx, |settings| {
+                settings.editor.lsp_document_colors = Some(DocumentColorsRenderMode::None);
             });
         });
     });
     cx_b.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |settings| {
-                settings.lsp_document_colors = Some(DocumentColorsRenderMode::Inlay);
+            store.update_user_settings(cx, |settings| {
+                settings.editor.lsp_document_colors = Some(DocumentColorsRenderMode::Inlay);
             });
         });
     });
@@ -2313,7 +2442,7 @@ async fn test_lsp_document_color(cx_a: &mut TestAppContext, cx_b: &mut TestAppCo
         .unwrap();
     let editor_a = workspace_a
         .update_in(cx_a, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "main.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -2373,7 +2502,7 @@ async fn test_lsp_document_color(cx_a: &mut TestAppContext, cx_b: &mut TestAppCo
     let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
     let editor_b = workspace_b
         .update_in(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "main.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -2381,6 +2510,7 @@ async fn test_lsp_document_color(cx_a: &mut TestAppContext, cx_b: &mut TestAppCo
         .unwrap();
 
     color_request_handle.next().await.unwrap();
+    executor.advance_clock(FETCH_COLORS_DEBOUNCE_TIMEOUT);
     executor.run_until_parked();
 
     assert_eq!(
@@ -2398,7 +2528,7 @@ async fn test_lsp_document_color(cx_a: &mut TestAppContext, cx_b: &mut TestAppCo
 
     editor_a.update_in(cx_a, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13].clone())
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)].clone())
         });
         editor.handle_input(":", window, cx);
     });
@@ -2422,8 +2552,8 @@ async fn test_lsp_document_color(cx_a: &mut TestAppContext, cx_b: &mut TestAppCo
 
     cx_b.update(|_, cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |settings| {
-                settings.lsp_document_colors = Some(DocumentColorsRenderMode::Background);
+            store.update_user_settings(cx, |settings| {
+                settings.editor.lsp_document_colors = Some(DocumentColorsRenderMode::Background);
             });
         });
     });
@@ -2450,8 +2580,8 @@ async fn test_lsp_document_color(cx_a: &mut TestAppContext, cx_b: &mut TestAppCo
 
     cx_b.update(|_, cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |settings| {
-                settings.lsp_document_colors = Some(DocumentColorsRenderMode::Inlay);
+            store.update_user_settings(cx, |settings| {
+                settings.editor.lsp_document_colors = Some(DocumentColorsRenderMode::Inlay);
             });
         });
     });
@@ -2478,8 +2608,8 @@ async fn test_lsp_document_color(cx_a: &mut TestAppContext, cx_b: &mut TestAppCo
 
     cx_a.update(|_, cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |settings| {
-                settings.lsp_document_colors = Some(DocumentColorsRenderMode::Border);
+            store.update_user_settings(cx, |settings| {
+                settings.editor.lsp_document_colors = Some(DocumentColorsRenderMode::Border);
             });
         });
     });
@@ -2524,6 +2654,27 @@ async fn test_lsp_pull_diagnostics(
     cx_a.update(editor::init);
     cx_b.update(editor::init);
 
+    let expected_push_diagnostic_main_message = "pushed main diagnostic";
+    let expected_push_diagnostic_lib_message = "pushed lib diagnostic";
+    let expected_pull_diagnostic_main_message = "pulled main diagnostic";
+    let expected_pull_diagnostic_lib_message = "pulled lib diagnostic";
+    let expected_workspace_pull_diagnostics_main_message = "pulled workspace main diagnostic";
+    let expected_workspace_pull_diagnostics_lib_message = "pulled workspace lib diagnostic";
+
+    let diagnostics_pulls_result_ids = Arc::new(Mutex::new(BTreeSet::<Option<String>>::new()));
+    let workspace_diagnostics_pulls_result_ids = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+    let diagnostics_pulls_made = Arc::new(AtomicUsize::new(0));
+    let closure_diagnostics_pulls_made = diagnostics_pulls_made.clone();
+    let closure_diagnostics_pulls_result_ids = diagnostics_pulls_result_ids.clone();
+    let workspace_diagnostics_pulls_made = Arc::new(AtomicUsize::new(0));
+    let closure_workspace_diagnostics_pulls_made = workspace_diagnostics_pulls_made.clone();
+    let closure_workspace_diagnostics_pulls_result_ids =
+        workspace_diagnostics_pulls_result_ids.clone();
+    let (workspace_diagnostic_cancel_tx, closure_workspace_diagnostic_cancel_rx) =
+        smol::channel::bounded::<()>(1);
+    let (closure_workspace_diagnostic_received_tx, workspace_diagnostic_received_rx) =
+        smol::channel::bounded::<()>(1);
+
     let capabilities = lsp::ServerCapabilities {
         diagnostic_provider: Some(lsp::DiagnosticServerCapabilities::Options(
             lsp::DiagnosticOptions {
@@ -2538,13 +2689,195 @@ async fn test_lsp_pull_diagnostics(
         ..lsp::ServerCapabilities::default()
     };
     client_a.language_registry().add(rust_lang());
+
+    let pull_diagnostics_handle = Arc::new(parking_lot::Mutex::new(None));
+    let workspace_diagnostics_pulls_handle = Arc::new(parking_lot::Mutex::new(None));
+
+    let closure_pull_diagnostics_handle = pull_diagnostics_handle.clone();
+    let closure_workspace_diagnostics_pulls_handle = workspace_diagnostics_pulls_handle.clone();
     let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             capabilities: capabilities.clone(),
+            initializer: Some(Box::new(move |fake_language_server| {
+                let expected_workspace_diagnostic_token = lsp::ProgressToken::String(format!(
+                    "workspace/diagnostic/{}/1",
+                    fake_language_server.server.server_id()
+                ));
+                let closure_workspace_diagnostics_pulls_result_ids = closure_workspace_diagnostics_pulls_result_ids.clone();
+                let diagnostics_pulls_made = closure_diagnostics_pulls_made.clone();
+                let diagnostics_pulls_result_ids = closure_diagnostics_pulls_result_ids.clone();
+                let closure_pull_diagnostics_handle = closure_pull_diagnostics_handle.clone();
+                let closure_workspace_diagnostics_pulls_handle = closure_workspace_diagnostics_pulls_handle.clone();
+                let closure_workspace_diagnostic_cancel_rx = closure_workspace_diagnostic_cancel_rx.clone();
+                let closure_workspace_diagnostic_received_tx = closure_workspace_diagnostic_received_tx.clone();
+                let pull_diagnostics_handle = fake_language_server
+                    .set_request_handler::<lsp::request::DocumentDiagnosticRequest, _, _>(
+                        move |params, _| {
+                            let requests_made = diagnostics_pulls_made.clone();
+                            let diagnostics_pulls_result_ids =
+                                diagnostics_pulls_result_ids.clone();
+                            async move {
+                                let message = if lsp::Uri::from_file_path(path!("/a/main.rs"))
+                                    .unwrap()
+                                    == params.text_document.uri
+                                {
+                                    expected_pull_diagnostic_main_message.to_string()
+                                } else if lsp::Uri::from_file_path(path!("/a/lib.rs")).unwrap()
+                                    == params.text_document.uri
+                                {
+                                    expected_pull_diagnostic_lib_message.to_string()
+                                } else {
+                                    panic!("Unexpected document: {}", params.text_document.uri)
+                                };
+                                {
+                                    diagnostics_pulls_result_ids
+                                        .lock()
+                                        .await
+                                        .insert(params.previous_result_id);
+                                }
+                                let new_requests_count =
+                                    requests_made.fetch_add(1, atomic::Ordering::Release) + 1;
+                                Ok(lsp::DocumentDiagnosticReportResult::Report(
+                                    lsp::DocumentDiagnosticReport::Full(
+                                        lsp::RelatedFullDocumentDiagnosticReport {
+                                            related_documents: None,
+                                            full_document_diagnostic_report:
+                                                lsp::FullDocumentDiagnosticReport {
+                                                    result_id: Some(format!(
+                                                        "pull-{new_requests_count}"
+                                                    )),
+                                                    items: vec![lsp::Diagnostic {
+                                                        range: lsp::Range {
+                                                            start: lsp::Position {
+                                                                line: 0,
+                                                                character: 0,
+                                                            },
+                                                            end: lsp::Position {
+                                                                line: 0,
+                                                                character: 2,
+                                                            },
+                                                        },
+                                                        severity: Some(
+                                                            lsp::DiagnosticSeverity::ERROR,
+                                                        ),
+                                                        message,
+                                                        ..lsp::Diagnostic::default()
+                                                    }],
+                                                },
+                                        },
+                                    ),
+                                ))
+                            }
+                        },
+                    );
+                let _ = closure_pull_diagnostics_handle.lock().insert(pull_diagnostics_handle);
+
+                let closure_workspace_diagnostics_pulls_made = closure_workspace_diagnostics_pulls_made.clone();
+                let workspace_diagnostics_pulls_handle = fake_language_server.set_request_handler::<lsp::request::WorkspaceDiagnosticRequest, _, _>(
+                    move |params, _| {
+                        let workspace_requests_made = closure_workspace_diagnostics_pulls_made.clone();
+                        let workspace_diagnostics_pulls_result_ids =
+                            closure_workspace_diagnostics_pulls_result_ids.clone();
+                        let workspace_diagnostic_cancel_rx = closure_workspace_diagnostic_cancel_rx.clone();
+                        let workspace_diagnostic_received_tx = closure_workspace_diagnostic_received_tx.clone();
+                        let expected_workspace_diagnostic_token = expected_workspace_diagnostic_token.clone();
+                        async move {
+                            let workspace_request_count =
+                                workspace_requests_made.fetch_add(1, atomic::Ordering::Release) + 1;
+                            {
+                                workspace_diagnostics_pulls_result_ids
+                                    .lock()
+                                    .await
+                                    .extend(params.previous_result_ids.into_iter().map(|id| id.value));
+                            }
+                            if should_stream_workspace_diagnostic && !workspace_diagnostic_cancel_rx.is_closed()
+                            {
+                                assert_eq!(
+                                    params.partial_result_params.partial_result_token,
+                                    Some(expected_workspace_diagnostic_token)
+                                );
+                                workspace_diagnostic_received_tx.send(()).await.unwrap();
+                                workspace_diagnostic_cancel_rx.recv().await.unwrap();
+                                workspace_diagnostic_cancel_rx.close();
+                                // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#partialResults
+                                // > The final response has to be empty in terms of result values.
+                                return Ok(lsp::WorkspaceDiagnosticReportResult::Report(
+                                    lsp::WorkspaceDiagnosticReport { items: Vec::new() },
+                                ));
+                            }
+                            Ok(lsp::WorkspaceDiagnosticReportResult::Report(
+                                lsp::WorkspaceDiagnosticReport {
+                                    items: vec![
+                                        lsp::WorkspaceDocumentDiagnosticReport::Full(
+                                            lsp::WorkspaceFullDocumentDiagnosticReport {
+                                                uri: lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
+                                                version: None,
+                                                full_document_diagnostic_report:
+                                                    lsp::FullDocumentDiagnosticReport {
+                                                        result_id: Some(format!(
+                                                            "workspace_{workspace_request_count}"
+                                                        )),
+                                                        items: vec![lsp::Diagnostic {
+                                                            range: lsp::Range {
+                                                                start: lsp::Position {
+                                                                    line: 0,
+                                                                    character: 1,
+                                                                },
+                                                                end: lsp::Position {
+                                                                    line: 0,
+                                                                    character: 3,
+                                                                },
+                                                            },
+                                                            severity: Some(lsp::DiagnosticSeverity::WARNING),
+                                                            message:
+                                                                expected_workspace_pull_diagnostics_main_message
+                                                                    .to_string(),
+                                                            ..lsp::Diagnostic::default()
+                                                        }],
+                                                    },
+                                            },
+                                        ),
+                                        lsp::WorkspaceDocumentDiagnosticReport::Full(
+                                            lsp::WorkspaceFullDocumentDiagnosticReport {
+                                                uri: lsp::Uri::from_file_path(path!("/a/lib.rs")).unwrap(),
+                                                version: None,
+                                                full_document_diagnostic_report:
+                                                    lsp::FullDocumentDiagnosticReport {
+                                                        result_id: Some(format!(
+                                                            "workspace_{workspace_request_count}"
+                                                        )),
+                                                        items: vec![lsp::Diagnostic {
+                                                            range: lsp::Range {
+                                                                start: lsp::Position {
+                                                                    line: 0,
+                                                                    character: 1,
+                                                                },
+                                                                end: lsp::Position {
+                                                                    line: 0,
+                                                                    character: 3,
+                                                                },
+                                                            },
+                                                            severity: Some(lsp::DiagnosticSeverity::WARNING),
+                                                            message:
+                                                                expected_workspace_pull_diagnostics_lib_message
+                                                                    .to_string(),
+                                                            ..lsp::Diagnostic::default()
+                                                        }],
+                                                    },
+                                            },
+                                        ),
+                                    ],
+                                },
+                            ))
+                        }
+                    });
+                let _ = closure_workspace_diagnostics_pulls_handle.lock().insert(workspace_diagnostics_pulls_handle);
+            })),
             ..FakeLspAdapter::default()
         },
     );
+
     client_b.language_registry().add(rust_lang());
     client_b.language_registry().register_fake_lsp_adapter(
         "Rust",
@@ -2594,7 +2927,7 @@ async fn test_lsp_pull_diagnostics(
         .unwrap();
     let editor_a_main = workspace_a
         .update_in(cx_a, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "main.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -2602,183 +2935,15 @@ async fn test_lsp_pull_diagnostics(
         .unwrap();
 
     let fake_language_server = fake_language_servers.next().await.unwrap();
-    cx_a.run_until_parked();
-    cx_b.run_until_parked();
-    let expected_push_diagnostic_main_message = "pushed main diagnostic";
-    let expected_push_diagnostic_lib_message = "pushed lib diagnostic";
-    let expected_pull_diagnostic_main_message = "pulled main diagnostic";
-    let expected_pull_diagnostic_lib_message = "pulled lib diagnostic";
-    let expected_workspace_pull_diagnostics_main_message = "pulled workspace main diagnostic";
-    let expected_workspace_pull_diagnostics_lib_message = "pulled workspace lib diagnostic";
-
-    let diagnostics_pulls_result_ids = Arc::new(Mutex::new(BTreeSet::<Option<String>>::new()));
-    let workspace_diagnostics_pulls_result_ids = Arc::new(Mutex::new(BTreeSet::<String>::new()));
-    let diagnostics_pulls_made = Arc::new(AtomicUsize::new(0));
-    let closure_diagnostics_pulls_made = diagnostics_pulls_made.clone();
-    let closure_diagnostics_pulls_result_ids = diagnostics_pulls_result_ids.clone();
-    let mut pull_diagnostics_handle = fake_language_server
-        .set_request_handler::<lsp::request::DocumentDiagnosticRequest, _, _>(move |params, _| {
-            let requests_made = closure_diagnostics_pulls_made.clone();
-            let diagnostics_pulls_result_ids = closure_diagnostics_pulls_result_ids.clone();
-            async move {
-                let message = if lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap()
-                    == params.text_document.uri
-                {
-                    expected_pull_diagnostic_main_message.to_string()
-                } else if lsp::Uri::from_file_path(path!("/a/lib.rs")).unwrap()
-                    == params.text_document.uri
-                {
-                    expected_pull_diagnostic_lib_message.to_string()
-                } else {
-                    panic!("Unexpected document: {}", params.text_document.uri)
-                };
-                {
-                    diagnostics_pulls_result_ids
-                        .lock()
-                        .await
-                        .insert(params.previous_result_id);
-                }
-                let new_requests_count = requests_made.fetch_add(1, atomic::Ordering::Release) + 1;
-                Ok(lsp::DocumentDiagnosticReportResult::Report(
-                    lsp::DocumentDiagnosticReport::Full(lsp::RelatedFullDocumentDiagnosticReport {
-                        related_documents: None,
-                        full_document_diagnostic_report: lsp::FullDocumentDiagnosticReport {
-                            result_id: Some(format!("pull-{new_requests_count}")),
-                            items: vec![lsp::Diagnostic {
-                                range: lsp::Range {
-                                    start: lsp::Position {
-                                        line: 0,
-                                        character: 0,
-                                    },
-                                    end: lsp::Position {
-                                        line: 0,
-                                        character: 2,
-                                    },
-                                },
-                                severity: Some(lsp::DiagnosticSeverity::ERROR),
-                                message,
-                                ..lsp::Diagnostic::default()
-                            }],
-                        },
-                    }),
-                ))
-            }
-        });
-
-    let workspace_diagnostics_pulls_made = Arc::new(AtomicUsize::new(0));
-    let closure_workspace_diagnostics_pulls_made = workspace_diagnostics_pulls_made.clone();
-    let closure_workspace_diagnostics_pulls_result_ids =
-        workspace_diagnostics_pulls_result_ids.clone();
-    let (workspace_diagnostic_cancel_tx, closure_workspace_diagnostic_cancel_rx) =
-        smol::channel::bounded::<()>(1);
-    let (closure_workspace_diagnostic_received_tx, workspace_diagnostic_received_rx) =
-        smol::channel::bounded::<()>(1);
     let expected_workspace_diagnostic_token = lsp::ProgressToken::String(format!(
         "workspace/diagnostic-{}-1",
         fake_language_server.server.server_id()
     ));
-    let closure_expected_workspace_diagnostic_token = expected_workspace_diagnostic_token.clone();
-    let mut workspace_diagnostics_pulls_handle = fake_language_server
-        .set_request_handler::<lsp::request::WorkspaceDiagnosticRequest, _, _>(
-        move |params, _| {
-            let workspace_requests_made = closure_workspace_diagnostics_pulls_made.clone();
-            let workspace_diagnostics_pulls_result_ids =
-                closure_workspace_diagnostics_pulls_result_ids.clone();
-            let workspace_diagnostic_cancel_rx = closure_workspace_diagnostic_cancel_rx.clone();
-            let workspace_diagnostic_received_tx = closure_workspace_diagnostic_received_tx.clone();
-            let expected_workspace_diagnostic_token =
-                closure_expected_workspace_diagnostic_token.clone();
-            async move {
-                let workspace_request_count =
-                    workspace_requests_made.fetch_add(1, atomic::Ordering::Release) + 1;
-                {
-                    workspace_diagnostics_pulls_result_ids
-                        .lock()
-                        .await
-                        .extend(params.previous_result_ids.into_iter().map(|id| id.value));
-                }
-                if should_stream_workspace_diagnostic && !workspace_diagnostic_cancel_rx.is_closed()
-                {
-                    assert_eq!(
-                        params.partial_result_params.partial_result_token,
-                        Some(expected_workspace_diagnostic_token)
-                    );
-                    workspace_diagnostic_received_tx.send(()).await.unwrap();
-                    workspace_diagnostic_cancel_rx.recv().await.unwrap();
-                    workspace_diagnostic_cancel_rx.close();
-                    // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#partialResults
-                    // > The final response has to be empty in terms of result values.
-                    return Ok(lsp::WorkspaceDiagnosticReportResult::Report(
-                        lsp::WorkspaceDiagnosticReport { items: Vec::new() },
-                    ));
-                }
-                Ok(lsp::WorkspaceDiagnosticReportResult::Report(
-                    lsp::WorkspaceDiagnosticReport {
-                        items: vec![
-                            lsp::WorkspaceDocumentDiagnosticReport::Full(
-                                lsp::WorkspaceFullDocumentDiagnosticReport {
-                                    uri: lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
-                                    version: None,
-                                    full_document_diagnostic_report:
-                                        lsp::FullDocumentDiagnosticReport {
-                                            result_id: Some(format!(
-                                                "workspace_{workspace_request_count}"
-                                            )),
-                                            items: vec![lsp::Diagnostic {
-                                                range: lsp::Range {
-                                                    start: lsp::Position {
-                                                        line: 0,
-                                                        character: 1,
-                                                    },
-                                                    end: lsp::Position {
-                                                        line: 0,
-                                                        character: 3,
-                                                    },
-                                                },
-                                                severity: Some(lsp::DiagnosticSeverity::WARNING),
-                                                message:
-                                                    expected_workspace_pull_diagnostics_main_message
-                                                        .to_string(),
-                                                ..lsp::Diagnostic::default()
-                                            }],
-                                        },
-                                },
-                            ),
-                            lsp::WorkspaceDocumentDiagnosticReport::Full(
-                                lsp::WorkspaceFullDocumentDiagnosticReport {
-                                    uri: lsp::Uri::from_file_path(path!("/a/lib.rs")).unwrap(),
-                                    version: None,
-                                    full_document_diagnostic_report:
-                                        lsp::FullDocumentDiagnosticReport {
-                                            result_id: Some(format!(
-                                                "workspace_{workspace_request_count}"
-                                            )),
-                                            items: vec![lsp::Diagnostic {
-                                                range: lsp::Range {
-                                                    start: lsp::Position {
-                                                        line: 0,
-                                                        character: 1,
-                                                    },
-                                                    end: lsp::Position {
-                                                        line: 0,
-                                                        character: 3,
-                                                    },
-                                                },
-                                                severity: Some(lsp::DiagnosticSeverity::WARNING),
-                                                message:
-                                                    expected_workspace_pull_diagnostics_lib_message
-                                                        .to_string(),
-                                                ..lsp::Diagnostic::default()
-                                            }],
-                                        },
-                                },
-                            ),
-                        ],
-                    },
-                ))
-            }
-        },
-    );
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+    let mut pull_diagnostics_handle = pull_diagnostics_handle.lock().take().unwrap();
+    let mut workspace_diagnostics_pulls_handle =
+        workspace_diagnostics_pulls_handle.lock().take().unwrap();
 
     if should_stream_workspace_diagnostic {
         workspace_diagnostic_received_rx.recv().await.unwrap();
@@ -2800,7 +2965,7 @@ async fn test_lsp_pull_diagnostics(
     editor_a_main.update(cx_a, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         assert_eq!(
             all_diagnostics.len(),
@@ -2820,7 +2985,7 @@ async fn test_lsp_pull_diagnostics(
     });
 
     fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
-        &lsp::PublishDiagnosticsParams {
+        lsp::PublishDiagnosticsParams {
             uri: lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
             diagnostics: vec![lsp::Diagnostic {
                 range: lsp::Range {
@@ -2841,7 +3006,7 @@ async fn test_lsp_pull_diagnostics(
         },
     );
     fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
-        &lsp::PublishDiagnosticsParams {
+        lsp::PublishDiagnosticsParams {
             uri: lsp::Uri::from_file_path(path!("/a/lib.rs")).unwrap(),
             diagnostics: vec![lsp::Diagnostic {
                 range: lsp::Range {
@@ -2863,7 +3028,7 @@ async fn test_lsp_pull_diagnostics(
     );
 
     if should_stream_workspace_diagnostic {
-        fake_language_server.notify::<lsp::notification::Progress>(&lsp::ProgressParams {
+        fake_language_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
             token: expected_workspace_diagnostic_token.clone(),
             value: lsp::ProgressParamsValue::WorkspaceDiagnostic(
                 lsp::WorkspaceDiagnosticReportResult::Report(lsp::WorkspaceDiagnosticReport {
@@ -2929,7 +3094,7 @@ async fn test_lsp_pull_diagnostics(
     editor_a_main.update(cx_a, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         assert_eq!(
             all_diagnostics.len(),
@@ -2953,7 +3118,7 @@ async fn test_lsp_pull_diagnostics(
     let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
     let editor_b_main = workspace_b
         .update_in(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "main.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -2976,7 +3141,7 @@ async fn test_lsp_pull_diagnostics(
     editor_b_main.update(cx_b, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         assert_eq!(
             all_diagnostics.len(),
@@ -3001,7 +3166,7 @@ async fn test_lsp_pull_diagnostics(
 
     let editor_b_lib = workspace_b
         .update_in(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "lib.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("lib.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -3023,7 +3188,7 @@ async fn test_lsp_pull_diagnostics(
     editor_b_lib.update(cx_b, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         let expected_messages = [
             expected_pull_diagnostic_lib_message,
@@ -3045,7 +3210,7 @@ async fn test_lsp_pull_diagnostics(
     });
 
     if should_stream_workspace_diagnostic {
-        fake_language_server.notify::<lsp::notification::Progress>(&lsp::ProgressParams {
+        fake_language_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
             token: expected_workspace_diagnostic_token.clone(),
             value: lsp::ProgressParamsValue::WorkspaceDiagnostic(
                 lsp::WorkspaceDiagnosticReportResult::Report(lsp::WorkspaceDiagnosticReport {
@@ -3090,7 +3255,7 @@ async fn test_lsp_pull_diagnostics(
         editor_b_lib.update(cx_b, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let all_diagnostics = snapshot
-                .diagnostics_in_range(0..snapshot.len())
+                .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
                 .collect::<Vec<_>>();
             let expected_messages = [
                 expected_workspace_pull_diagnostics_lib_message,
@@ -3225,7 +3390,7 @@ async fn test_lsp_pull_diagnostics(
     editor_b_lib.update(cx_b, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         let expected_messages = [
             expected_workspace_pull_diagnostics_lib_message,
@@ -3243,7 +3408,7 @@ async fn test_lsp_pull_diagnostics(
     editor_b_main.update(cx_b, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         assert_eq!(all_diagnostics.len(), 2);
 
@@ -3262,7 +3427,7 @@ async fn test_lsp_pull_diagnostics(
     editor_a_main.update(cx_a, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         assert_eq!(all_diagnostics.len(), 2);
         let expected_messages = [
@@ -3306,20 +3471,20 @@ async fn test_git_blame_is_forwarded(cx_a: &mut TestAppContext, cx_b: &mut TestA
     cx_b.update(editor::init);
     // Turn inline-blame-off by default so no state is transferred without us explicitly doing so
     let inline_blame_off_settings = Some(InlineBlameSettings {
-        enabled: false,
+        enabled: Some(false),
         ..Default::default()
     });
     cx_a.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<ProjectSettings>(cx, |settings| {
-                settings.git.inline_blame = inline_blame_off_settings;
+            store.update_user_settings(cx, |settings| {
+                settings.git.get_or_insert_default().inline_blame = inline_blame_off_settings;
             });
         });
     });
     cx_b.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<ProjectSettings>(cx, |settings| {
-                settings.git.inline_blame = inline_blame_off_settings;
+            store.update_user_settings(cx, |settings| {
+                settings.git.get_or_insert_default().inline_blame = inline_blame_off_settings;
             });
         });
     });
@@ -3355,7 +3520,7 @@ async fn test_git_blame_is_forwarded(cx_a: &mut TestAppContext, cx_b: &mut TestA
     };
     client_a.fs().set_blame_for_repo(
         Path::new(path!("/my-repo/.git")),
-        vec![("file.txt".into(), blame)],
+        vec![(repo_path("file.txt"), blame)],
     );
 
     let (project_a, worktree_id) = client_a.build_local_project(path!("/my-repo"), cx_a).await;
@@ -3368,7 +3533,7 @@ async fn test_git_blame_is_forwarded(cx_a: &mut TestAppContext, cx_b: &mut TestA
     let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
     let editor_a = workspace_a
         .update_in(cx_a, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "file.txt"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("file.txt")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -3380,7 +3545,7 @@ async fn test_git_blame_is_forwarded(cx_a: &mut TestAppContext, cx_b: &mut TestA
     let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
     let editor_b = workspace_b
         .update_in(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "file.txt"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("file.txt")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -3558,13 +3723,13 @@ async fn test_collaborating_with_editorconfig(
         .unwrap();
     let main_buffer_a = project_a
         .update(cx_a, |p, cx| {
-            p.open_buffer((worktree_id, "src/main.rs"), cx)
+            p.open_buffer((worktree_id, rel_path("src/main.rs")), cx)
         })
         .await
         .unwrap();
     let other_buffer_a = project_a
         .update(cx_a, |p, cx| {
-            p.open_buffer((worktree_id, "src/other_mod/other.rs"), cx)
+            p.open_buffer((worktree_id, rel_path("src/other_mod/other.rs")), cx)
         })
         .await
         .unwrap();
@@ -3592,13 +3757,13 @@ async fn test_collaborating_with_editorconfig(
     let project_b = client_b.join_remote_project(project_id, cx_b).await;
     let main_buffer_b = project_b
         .update(cx_b, |p, cx| {
-            p.open_buffer((worktree_id, "src/main.rs"), cx)
+            p.open_buffer((worktree_id, rel_path("src/main.rs")), cx)
         })
         .await
         .unwrap();
     let other_buffer_b = project_b
         .update(cx_b, |p, cx| {
-            p.open_buffer((worktree_id, "src/other_mod/other.rs"), cx)
+            p.open_buffer((worktree_id, rel_path("src/other_mod/other.rs")), cx)
         })
         .await
         .unwrap();
@@ -3717,7 +3882,7 @@ fn main() { let foo = other::foo(); }"};
 
     let editorconfig_buffer_b = project_b
         .update(cx_b, |p, cx| {
-            p.open_buffer((worktree_id, "src/other_mod/.editorconfig"), cx)
+            p.open_buffer((worktree_id, rel_path("src/other_mod/.editorconfig")), cx)
         })
         .await
         .unwrap();
@@ -3794,7 +3959,7 @@ async fn test_add_breakpoints(cx_a: &mut TestAppContext, cx_b: &mut TestAppConte
     let (project_a, worktree_id) = client_a.build_local_project("/a", cx_a).await;
     let project_path = ProjectPath {
         worktree_id,
-        path: Arc::from(Path::new(&"test.txt")),
+        path: rel_path(&"test.txt").into(),
     };
     let abs_path = project_a.read_with(cx_a, |project, cx| {
         project
@@ -4017,7 +4182,7 @@ async fn test_client_can_query_lsp_ext(cx_a: &mut TestAppContext, cx_b: &mut Tes
 
     let editor_a = workspace_a
         .update_in(cx_a, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "main.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -4026,7 +4191,7 @@ async fn test_client_can_query_lsp_ext(cx_a: &mut TestAppContext, cx_b: &mut Tes
 
     let editor_b = workspace_b
         .update_in(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id, "main.rs"), None, true, window, cx)
+            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
         })
         .await
         .unwrap()
@@ -4111,6 +4276,288 @@ async fn test_client_can_query_lsp_ext(cx_a: &mut TestAppContext, cx_b: &mut Tes
     });
 }
 
+#[gpui::test]
+async fn test_copy_file_name_without_extension(
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) {
+    let mut server = TestServer::start(cx_a.executor()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+
+    cx_b.update(editor::init);
+
+    client_a
+        .fs()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "src": {
+                    "main.rs": indoc! {"
+                        fn main() {
+                            println!(\"Hello, world!\");
+                        }
+                    "},
+                }
+            }),
+        )
+        .await;
+
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/root"), cx_a).await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+
+    let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
+    let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
+
+    let editor_a = workspace_a
+        .update_in(cx_a, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    let editor_b = workspace_b
+        .update_in(cx_b, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+
+    editor_a.update_in(cx_a, |editor, window, cx| {
+        editor.copy_file_name_without_extension(&CopyFileNameWithoutExtension, window, cx);
+    });
+
+    assert_eq!(
+        cx_a.read_from_clipboard().and_then(|item| item.text()),
+        Some("main".to_string())
+    );
+
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        editor.copy_file_name_without_extension(&CopyFileNameWithoutExtension, window, cx);
+    });
+
+    assert_eq!(
+        cx_b.read_from_clipboard().and_then(|item| item.text()),
+        Some("main".to_string())
+    );
+}
+
+#[gpui::test]
+async fn test_copy_file_name(cx_a: &mut TestAppContext, cx_b: &mut TestAppContext) {
+    let mut server = TestServer::start(cx_a.executor()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+
+    cx_b.update(editor::init);
+
+    client_a
+        .fs()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "src": {
+                    "main.rs": indoc! {"
+                        fn main() {
+                            println!(\"Hello, world!\");
+                        }
+                    "},
+                }
+            }),
+        )
+        .await;
+
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/root"), cx_a).await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+
+    let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
+    let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
+
+    let editor_a = workspace_a
+        .update_in(cx_a, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    let editor_b = workspace_b
+        .update_in(cx_b, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+
+    editor_a.update_in(cx_a, |editor, window, cx| {
+        editor.copy_file_name(&CopyFileName, window, cx);
+    });
+
+    assert_eq!(
+        cx_a.read_from_clipboard().and_then(|item| item.text()),
+        Some("main.rs".to_string())
+    );
+
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        editor.copy_file_name(&CopyFileName, window, cx);
+    });
+
+    assert_eq!(
+        cx_b.read_from_clipboard().and_then(|item| item.text()),
+        Some("main.rs".to_string())
+    );
+}
+
+#[gpui::test]
+async fn test_copy_file_location(cx_a: &mut TestAppContext, cx_b: &mut TestAppContext) {
+    let mut server = TestServer::start(cx_a.executor()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+
+    cx_b.update(editor::init);
+
+    client_a
+        .fs()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "src": {
+                    "main.rs": indoc! {"
+                        fn main() {
+                            println!(\"Hello, world!\");
+                        }
+                    "},
+                }
+            }),
+        )
+        .await;
+
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/root"), cx_a).await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+
+    let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
+    let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
+
+    let editor_a = workspace_a
+        .update_in(cx_a, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    let editor_b = workspace_b
+        .update_in(cx_b, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+
+    editor_a.update_in(cx_a, |editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |s| {
+            s.select_ranges([MultiBufferOffset(16)..MultiBufferOffset(16)]);
+        });
+        editor.copy_file_location(&CopyFileLocation, window, cx);
+    });
+
+    assert_eq!(
+        cx_a.read_from_clipboard().and_then(|item| item.text()),
+        Some(format!("{}:2", path!("src/main.rs")))
+    );
+
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |s| {
+            s.select_ranges([MultiBufferOffset(16)..MultiBufferOffset(16)]);
+        });
+        editor.copy_file_location(&CopyFileLocation, window, cx);
+    });
+
+    assert_eq!(
+        cx_b.read_from_clipboard().and_then(|item| item.text()),
+        Some(format!("{}:2", path!("src/main.rs")))
+    );
+}
+
 #[track_caller]
 fn tab_undo_assert(
     cx_a: &mut EditorTestContext,
@@ -4153,15 +4600,35 @@ fn tab_undo_assert(
     cx_b.assert_editor_state(expected_initial);
 }
 
-fn extract_hint_labels(editor: &Editor) -> Vec<String> {
-    let mut labels = Vec::new();
-    for hint in editor.inlay_hint_cache().hints() {
-        match hint.label {
-            project::InlayHintLabel::String(s) => labels.push(s),
-            _ => unreachable!(),
-        }
+fn extract_hint_labels(editor: &Editor, cx: &mut App) -> Vec<String> {
+    let lsp_store = editor.project().unwrap().read(cx).lsp_store();
+
+    let mut all_cached_labels = Vec::new();
+    let mut all_fetched_hints = Vec::new();
+    for buffer in editor.buffer().read(cx).all_buffers() {
+        lsp_store.update(cx, |lsp_store, cx| {
+            let hints = &lsp_store.latest_lsp_data(&buffer, cx).inlay_hints();
+            all_cached_labels.extend(hints.all_cached_hints().into_iter().map(|hint| {
+                let mut label = hint.text().to_string();
+                if hint.padding_left {
+                    label.insert(0, ' ');
+                }
+                if hint.padding_right {
+                    label.push_str(" ");
+                }
+                label
+            }));
+            all_fetched_hints.extend(hints.all_fetched_hints());
+        });
     }
-    labels
+
+    assert!(
+        all_fetched_hints.is_empty(),
+        "Did not expect background hints fetch tasks, but got {} of them",
+        all_fetched_hints.len()
+    );
+
+    all_cached_labels
 }
 
 #[track_caller]

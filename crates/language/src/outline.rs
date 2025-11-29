@@ -16,10 +16,10 @@ pub struct Outline<T> {
 pub struct OutlineItem<T> {
     pub depth: usize,
     pub range: Range<T>,
+    pub source_range_for_text: Range<T>,
     pub text: String,
     pub highlight_ranges: Vec<(Range<usize>, HighlightStyle)>,
     pub name_ranges: Vec<Range<usize>>,
-    pub signature_range: Option<Range<T>>,
     pub body_range: Option<Range<T>>,
     pub annotation_range: Option<Range<T>>,
 }
@@ -33,13 +33,11 @@ impl<T: ToPoint> OutlineItem<T> {
         OutlineItem {
             depth: self.depth,
             range: self.range.start.to_point(buffer)..self.range.end.to_point(buffer),
+            source_range_for_text: self.source_range_for_text.start.to_point(buffer)
+                ..self.source_range_for_text.end.to_point(buffer),
             text: self.text.clone(),
             highlight_ranges: self.highlight_ranges.clone(),
             name_ranges: self.name_ranges.clone(),
-            signature_range: self
-                .signature_range
-                .as_ref()
-                .map(|r| r.start.to_point(buffer)..r.end.to_point(buffer)),
             body_range: self
                 .body_range
                 .as_ref()
@@ -210,20 +208,20 @@ mod tests {
             OutlineItem {
                 depth: 0,
                 range: Point::new(0, 0)..Point::new(5, 0),
+                source_range_for_text: Point::new(0, 0)..Point::new(0, 9),
                 text: "class Foo".to_string(),
                 highlight_ranges: vec![],
                 name_ranges: vec![6..9],
-                signature_range: None,
                 body_range: None,
                 annotation_range: None,
             },
             OutlineItem {
                 depth: 0,
                 range: Point::new(2, 0)..Point::new(2, 7),
+                source_range_for_text: Point::new(0, 0)..Point::new(0, 7),
                 text: "private".to_string(),
                 highlight_ranges: vec![],
                 name_ranges: vec![],
-                signature_range: None,
                 body_range: None,
                 annotation_range: None,
             },
@@ -245,20 +243,20 @@ mod tests {
             OutlineItem {
                 depth: 0,
                 range: Point::new(0, 0)..Point::new(5, 0),
+                source_range_for_text: Point::new(0, 0)..Point::new(0, 10),
                 text: "fn process".to_string(),
                 highlight_ranges: vec![],
                 name_ranges: vec![3..10],
-                signature_range: None,
                 body_range: None,
                 annotation_range: None,
             },
             OutlineItem {
                 depth: 0,
                 range: Point::new(7, 0)..Point::new(12, 0),
+                source_range_for_text: Point::new(0, 0)..Point::new(0, 20),
                 text: "struct DataProcessor".to_string(),
                 highlight_ranges: vec![],
                 name_ranges: vec![7..20],
-                signature_range: None,
                 body_range: None,
                 annotation_range: None,
             },

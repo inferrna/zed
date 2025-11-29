@@ -49,8 +49,10 @@ messages!(
     (ChannelMessageUpdate, Foreground),
     (CloseBuffer, Foreground),
     (Commit, Background),
+    (RunGitHook, Background),
     (CopyProjectEntry, Foreground),
     (CreateBufferForPeer, Foreground),
+    (CreateImageForPeer, Foreground),
     (CreateChannel, Foreground),
     (CreateChannelResponse, Foreground),
     (CreateContext, Foreground),
@@ -179,9 +181,11 @@ messages!(
     (OnTypeFormattingResponse, Background),
     (OpenBufferById, Background),
     (OpenBufferByPath, Background),
+    (OpenImageByPath, Background),
     (OpenBufferForSymbol, Background),
     (OpenBufferForSymbolResponse, Background),
     (OpenBufferResponse, Background),
+    (OpenImageResponse, Background),
     (OpenCommitMessageBuffer, Background),
     (OpenContext, Foreground),
     (OpenContextResponse, Foreground),
@@ -286,6 +290,7 @@ messages!(
     (RemoveRepository, Foreground),
     (UsersResponse, Foreground),
     (GitReset, Background),
+    (GitDeleteBranch, Background),
     (GitCheckoutFiles, Background),
     (GitShow, Background),
     (GitCommitDetails, Background),
@@ -300,6 +305,7 @@ messages!(
     (AskPassResponse, Background),
     (GitCreateBranch, Background),
     (GitChangeBranch, Background),
+    (GitRenameBranch, Background),
     (CheckForPushedCommits, Background),
     (CheckForPushedCommitsResponse, Background),
     (GitDiff, Background),
@@ -315,14 +321,25 @@ messages!(
     (PullWorkspaceDiagnostics, Background),
     (GetDefaultBranch, Background),
     (GetDefaultBranchResponse, Background),
+    (GetTreeDiff, Background),
+    (GetTreeDiffResponse, Background),
+    (GetBlobContent, Background),
+    (GetBlobContentResponse, Background),
     (GitClone, Background),
     (GitCloneResponse, Background),
     (ToggleLspLogs, Background),
+    (GetDirectoryEnvironment, Background),
+    (DirectoryEnvironment, Background),
     (GetAgentServerCommand, Background),
     (AgentServerCommand, Background),
     (ExternalAgentsUpdated, Background),
+    (ExternalExtensionAgentsUpdated, Background),
     (ExternalAgentLoadingStatusUpdated, Background),
     (NewExternalAgentVersionAvailable, Background),
+    (RemoteStarted, Background),
+    (GitGetWorktrees, Background),
+    (GitWorktreesResponse, Background),
+    (GitCreateWorktree, Background)
 );
 
 request_messages!(
@@ -334,6 +351,7 @@ request_messages!(
     (Call, Ack),
     (CancelCall, Ack),
     (Commit, Ack),
+    (RunGitHook, Ack),
     (CopyProjectEntry, ProjectEntryResponse),
     (CreateChannel, CreateChannelResponse),
     (CreateProjectEntry, ProjectEntryResponse),
@@ -386,6 +404,7 @@ request_messages!(
     (OnTypeFormatting, OnTypeFormattingResponse),
     (OpenBufferById, OpenBufferResponse),
     (OpenBufferByPath, OpenBufferResponse),
+    (OpenImageByPath, OpenImageResponse),
     (OpenBufferForSymbol, OpenBufferForSymbolResponse),
     (OpenCommitMessageBuffer, OpenBufferResponse),
     (OpenNewBuffer, OpenBufferResponse),
@@ -474,6 +493,7 @@ request_messages!(
     (RegisterBufferWithLanguageServers, Ack),
     (GitShow, GitCommitDetails),
     (GitReset, Ack),
+    (GitDeleteBranch, Ack),
     (GitCheckoutFiles, Ack),
     (SetIndexText, Ack),
     (Push, RemoteMessageResponse),
@@ -483,6 +503,7 @@ request_messages!(
     (AskPassRequest, AskPassResponse),
     (GitCreateBranch, Ack),
     (GitChangeBranch, Ack),
+    (GitRenameBranch, Ack),
     (CheckForPushedCommits, CheckForPushedCommitsResponse),
     (GitDiff, GitDiffResponse),
     (GitInit, Ack),
@@ -492,10 +513,16 @@ request_messages!(
     (GetDocumentDiagnostics, GetDocumentDiagnosticsResponse),
     (PullWorkspaceDiagnostics, Ack),
     (GetDefaultBranch, GetDefaultBranchResponse),
+    (GetBlobContent, GetBlobContentResponse),
+    (GetTreeDiff, GetTreeDiffResponse),
     (GitClone, GitCloneResponse),
     (ToggleLspLogs, Ack),
+    (GetDirectoryEnvironment, DirectoryEnvironment),
     (GetProcesses, GetProcessesResponse),
-    (GetAgentServerCommand, AgentServerCommand)
+    (GetAgentServerCommand, AgentServerCommand),
+    (RemoteStarted, Ack),
+    (GitGetWorktrees, GitWorktreesResponse),
+    (GitCreateWorktree, Ack)
 );
 
 lsp_messages!(
@@ -510,6 +537,7 @@ lsp_messages!(
     (GetDeclaration, GetDeclarationResponse, true),
     (GetTypeDefinition, GetTypeDefinitionResponse, true),
     (GetImplementation, GetImplementationResponse, true),
+    (InlayHints, InlayHintsResponse, false),
 );
 
 entity_messages!(
@@ -523,9 +551,11 @@ entity_messages!(
     BufferSaved,
     CloseBuffer,
     Commit,
+    RunGitHook,
     GetColorPresentation,
     CopyProjectEntry,
     CreateBufferForPeer,
+    CreateImageForPeer,
     CreateProjectEntry,
     GetDocumentColor,
     DeleteProjectEntry,
@@ -562,6 +592,7 @@ entity_messages!(
     OpenNewBuffer,
     OpenBufferById,
     OpenBufferByPath,
+    OpenImageByPath,
     OpenBufferForSymbol,
     OpenCommitMessageBuffer,
     PerformRename,
@@ -627,9 +658,11 @@ entity_messages!(
     RegisterBufferWithLanguageServers,
     GitShow,
     GitReset,
+    GitDeleteBranch,
     GitCheckoutFiles,
     SetIndexText,
     ToggleLspLogs,
+    GetDirectoryEnvironment,
 
     Push,
     Fetch,
@@ -637,6 +670,7 @@ entity_messages!(
     Pull,
     AskPassRequest,
     GitChangeBranch,
+    GitRenameBranch,
     GitCreateBranch,
     CheckForPushedCommits,
     GitDiff,
@@ -649,11 +683,16 @@ entity_messages!(
     GetDocumentDiagnostics,
     PullWorkspaceDiagnostics,
     GetDefaultBranch,
+    GetTreeDiff,
+    GetBlobContent,
     GitClone,
     GetAgentServerCommand,
     ExternalAgentsUpdated,
+    ExternalExtensionAgentsUpdated,
     ExternalAgentLoadingStatusUpdated,
     NewExternalAgentVersionAvailable,
+    GitGetWorktrees,
+    GitCreateWorktree
 );
 
 entity_messages!(
@@ -838,6 +877,7 @@ impl LspQuery {
             Some(lsp_query::Request::GetImplementation(_)) => ("GetImplementation", false),
             Some(lsp_query::Request::GetReferences(_)) => ("GetReferences", false),
             Some(lsp_query::Request::GetDocumentColor(_)) => ("GetDocumentColor", false),
+            Some(lsp_query::Request::InlayHints(_)) => ("InlayHints", false),
             None => ("<unknown>", true),
         }
     }
@@ -869,25 +909,5 @@ mod tests {
             id: u32::MAX,
         };
         assert_eq!(PeerId::from_u64(peer_id.as_u64()), peer_id);
-    }
-
-    #[test]
-    #[cfg(target_os = "windows")]
-    fn test_proto() {
-        use std::path::PathBuf;
-
-        fn generate_proto_path(path: PathBuf) -> PathBuf {
-            let proto = path.to_proto();
-            PathBuf::from_proto(proto)
-        }
-
-        let path = PathBuf::from("C:\\foo\\bar");
-        assert_eq!(path, generate_proto_path(path.clone()));
-
-        let path = PathBuf::from("C:/foo/bar/");
-        assert_eq!(path, generate_proto_path(path.clone()));
-
-        let path = PathBuf::from("C:/foo\\bar\\");
-        assert_eq!(path, generate_proto_path(path.clone()));
     }
 }

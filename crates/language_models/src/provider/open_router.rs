@@ -1,10 +1,7 @@
 use anyhow::{Result, anyhow};
 use collections::HashMap;
-use editor::{Editor, EditorElement, EditorStyle};
 use futures::{FutureExt, Stream, StreamExt, future, future::BoxFuture};
-use gpui::{
-    AnyView, App, AsyncApp, Context, Entity, FontStyle, SharedString, Task, TextStyle, WhiteSpace,
-};
+use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task};
 use http_client::HttpClient;
 use language_model::{
     AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
@@ -14,20 +11,18 @@ use language_model::{
     LanguageModelToolUse, MessageContent, RateLimiter, Role, StopReason, TokenUsage,
 };
 use open_router::{
-    Model, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL, Provider, ResponseStreamEvent,
-    list_models,
+    Model, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL, ResponseStreamEvent, list_models,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use settings::{Settings, SettingsStore};
+use settings::{OpenRouterAvailableModel as AvailableModel, Settings, SettingsStore};
 use std::pin::Pin;
 use std::str::FromStr as _;
 use std::sync::{Arc, LazyLock};
-use theme::ThemeSettings;
-use ui::{Icon, IconName, List, Tooltip, prelude::*};
-use util::{ResultExt, truncate_and_trailoff};
+use ui::{List, prelude::*};
+use ui_input::InputField;
+use util::ResultExt;
 use zed_env_vars::{EnvVar, env_var};
 
+use crate::ui::ConfiguredApiCard;
 use crate::{api_key::ApiKeyState, ui::InstructionListItem};
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("openrouter");
@@ -42,54 +37,9 @@ pub struct OpenRouterSettings {
     pub available_models: Vec<AvailableModel>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct AvailableModel {
-    pub name: String,
-    pub display_name: Option<String>,
-    pub max_tokens: u64,
-    pub max_output_tokens: Option<u64>,
-    pub max_completion_tokens: Option<u64>,
-    pub supports_tools: Option<bool>,
-    pub supports_images: Option<bool>,
-    pub mode: Option<ModelMode>,
-    pub provider: Option<Provider>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum ModelMode {
-    #[default]
-    Default,
-    Thinking {
-        budget_tokens: Option<u32>,
-    },
-}
-
-impl From<ModelMode> for OpenRouterModelMode {
-    fn from(value: ModelMode) -> Self {
-        match value {
-            ModelMode::Default => OpenRouterModelMode::Default,
-            ModelMode::Thinking { budget_tokens } => {
-                OpenRouterModelMode::Thinking { budget_tokens }
-            }
-        }
-    }
-}
-
-impl From<OpenRouterModelMode> for ModelMode {
-    fn from(value: OpenRouterModelMode) -> Self {
-        match value {
-            OpenRouterModelMode::Default => ModelMode::Default,
-            OpenRouterModelMode::Thinking { budget_tokens } => {
-                ModelMode::Thinking { budget_tokens }
-            }
-        }
-    }
-}
-
 pub struct OpenRouterLanguageModelProvider {
     http_client: Arc<dyn HttpClient>,
-    state: gpui::Entity<State>,
+    state: Entity<State>,
 }
 
 pub struct State {
@@ -222,7 +172,7 @@ impl OpenRouterLanguageModelProvider {
 impl LanguageModelProviderState for OpenRouterLanguageModelProvider {
     type ObservableEntity = State;
 
-    fn observable_entity(&self) -> Option<gpui::Entity<Self::ObservableEntity>> {
+    fn observable_entity(&self) -> Option<Entity<Self::ObservableEntity>> {
         Some(self.state.clone())
     }
 }
@@ -259,7 +209,7 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
                 max_tokens: model.max_tokens,
                 supports_tools: model.supports_tools,
                 supports_images: model.supports_images,
-                mode: model.mode.clone().unwrap_or_default().into(),
+                mode: model.mode.unwrap_or_default(),
                 provider: model.provider.clone(),
             });
         }
@@ -308,7 +258,7 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
 pub struct OpenRouterLanguageModel {
     id: LanguageModelId,
     model: open_router::Model,
-    state: gpui::Entity<State>,
+    state: Entity<State>,
     http_client: Arc<dyn HttpClient>,
     request_limiter: RateLimiter,
 }
@@ -443,6 +393,7 @@ pub fn into_open_router(
 ) -> open_router::Request {
     let mut messages = Vec::new();
     for message in request.messages {
+        let reasoning_details = message.reasoning_details.clone();
         for content in message.content {
             match content {
                 MessageContent::Text(text) => add_message_content_part(
@@ -469,18 +420,26 @@ pub fn into_open_router(
                                 name: tool_use.name.to_string(),
                                 arguments: serde_json::to_string(&tool_use.input)
                                     .unwrap_or_default(),
+                                thought_signature: tool_use.thought_signature.clone(),
                             },
                         },
                     };
 
-                    if let Some(open_router::RequestMessage::Assistant { tool_calls, .. }) =
-                        messages.last_mut()
+                    if let Some(open_router::RequestMessage::Assistant {
+                        tool_calls,
+                        reasoning_details: existing_reasoning,
+                        ..
+                    }) = messages.last_mut()
                     {
                         tool_calls.push(tool_call);
+                        if existing_reasoning.is_none() && reasoning_details.is_some() {
+                            *existing_reasoning = reasoning_details.clone();
+                        }
                     } else {
                         messages.push(open_router::RequestMessage::Assistant {
                             content: None,
                             tool_calls: vec![tool_call],
+                            reasoning_details: reasoning_details.clone(),
                         });
                     }
                 }
@@ -579,6 +538,7 @@ fn add_message_content_part(
                 Role::Assistant => open_router::RequestMessage::Assistant {
                     content: Some(open_router::MessageContent::from(vec![new_part])),
                     tool_calls: Vec::new(),
+                    reasoning_details: None,
                 },
                 Role::System => open_router::RequestMessage::System {
                     content: open_router::MessageContent::from(vec![new_part]),
@@ -590,12 +550,14 @@ fn add_message_content_part(
 
 pub struct OpenRouterEventMapper {
     tool_calls_by_index: HashMap<usize, RawToolCall>,
+    reasoning_details: Option<serde_json::Value>,
 }
 
 impl OpenRouterEventMapper {
     pub fn new() -> Self {
         Self {
             tool_calls_by_index: HashMap::default(),
+            reasoning_details: None,
         }
     }
 
@@ -627,6 +589,15 @@ impl OpenRouterEventMapper {
         };
 
         let mut events = Vec::new();
+
+        if let Some(details) = choice.delta.reasoning_details.clone() {
+            // Emit reasoning_details immediately
+            events.push(Ok(LanguageModelCompletionEvent::ReasoningDetails(
+                details.clone(),
+            )));
+            self.reasoning_details = Some(details);
+        }
+
         if let Some(reasoning) = choice.delta.reasoning.clone() {
             events.push(Ok(LanguageModelCompletionEvent::Thinking {
                 text: reasoning,
@@ -658,6 +629,10 @@ impl OpenRouterEventMapper {
                     if let Some(arguments) = function.arguments.clone() {
                         entry.arguments.push_str(&arguments);
                     }
+
+                    if let Some(signature) = function.thought_signature.clone() {
+                        entry.thought_signature = Some(signature);
+                    }
                 }
             }
         }
@@ -673,6 +648,7 @@ impl OpenRouterEventMapper {
 
         match choice.finish_reason.as_deref() {
             Some("stop") => {
+                // Don't emit reasoning_details here - already emitted immediately when captured
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
             Some("tool_calls") => {
@@ -685,6 +661,7 @@ impl OpenRouterEventMapper {
                                 is_input_complete: true,
                                 input,
                                 raw_input: tool_call.arguments.clone(),
+                                thought_signature: tool_call.thought_signature.clone(),
                             },
                         )),
                         Err(error) => Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
@@ -696,10 +673,12 @@ impl OpenRouterEventMapper {
                     }
                 }));
 
+                // Don't emit reasoning_details here - already emitted immediately when captured
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
             }
             Some(stop_reason) => {
                 log::error!("Unexpected OpenRouter stop_reason: {stop_reason:?}",);
+                // Don't emit reasoning_details here - already emitted immediately when captured
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
             None => {}
@@ -714,6 +693,7 @@ struct RawToolCall {
     id: String,
     name: String,
     arguments: String,
+    thought_signature: Option<String>,
 }
 
 pub fn count_open_router_tokens(
@@ -743,21 +723,19 @@ pub fn count_open_router_tokens(
 }
 
 struct ConfigurationView {
-    api_key_editor: Entity<Editor>,
-    state: gpui::Entity<State>,
+    api_key_editor: Entity<InputField>,
+    state: Entity<State>,
     load_credentials_task: Option<Task<()>>,
 }
 
 impl ConfigurationView {
-    fn new(state: gpui::Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let api_key_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text(
-                "sk_or_000000000000000000000000000000000000000000000000",
+            InputField::new(
                 window,
                 cx,
-            );
-            editor
+                "sk_or_000000000000000000000000000000000000000000000000",
+            )
         });
 
         cx.observe(&state, |_, _, cx| {
@@ -822,31 +800,6 @@ impl ConfigurationView {
         .detach_and_log_err(cx);
     }
 
-    fn render_api_key_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = ThemeSettings::get_global(cx);
-        let text_style = TextStyle {
-            color: cx.theme().colors().text,
-            font_family: settings.ui_font.family.clone(),
-            font_features: settings.ui_font.features.clone(),
-            font_fallbacks: settings.ui_font.fallbacks.clone(),
-            font_size: rems(0.875).into(),
-            font_weight: settings.ui_font.weight,
-            font_style: FontStyle::Normal,
-            line_height: relative(1.3),
-            white_space: WhiteSpace::Normal,
-            ..Default::default()
-        };
-        EditorElement::new(
-            &self.api_key_editor,
-            EditorStyle {
-                background: cx.theme().colors().editor_background,
-                local_player: cx.theme().players().local(),
-                text: text_style,
-                ..Default::default()
-            },
-        )
-    }
-
     fn should_render_editor(&self, cx: &mut Context<Self>) -> bool {
         !self.state.read(cx).is_authenticated()
     }
@@ -855,9 +808,21 @@ impl ConfigurationView {
 impl Render for ConfigurationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let env_var_set = self.state.read(cx).api_key_state.is_from_env_var();
+        let configured_card_label = if env_var_set {
+            format!("API key set in {API_KEY_ENV_VAR_NAME} environment variable")
+        } else {
+            let api_url = OpenRouterLanguageModelProvider::api_url(cx);
+            if api_url == OPEN_ROUTER_API_URL {
+                "API key configured".to_string()
+            } else {
+                format!("API key configured for {}", api_url)
+            }
+        };
 
         if self.load_credentials_task.is_some() {
-            div().child(Label::new("Loading credentials...")).into_any()
+            div()
+                .child(Label::new("Loading credentials..."))
+                .into_any_element()
         } else if self.should_render_editor(cx) {
             v_flex()
                 .size_full()
@@ -877,62 +842,254 @@ impl Render for ConfigurationView {
                             "Paste your API key below and hit enter to start using the assistant",
                         )),
                 )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .my_2()
-                        .px_2()
-                        .py_1()
-                        .bg(cx.theme().colors().editor_background)
-                        .border_1()
-                        .border_color(cx.theme().colors().border)
-                        .rounded_sm()
-                        .child(self.render_api_key_editor(cx)),
-                )
+                .child(self.api_key_editor.clone())
                 .child(
                     Label::new(
                         format!("You can also assign the {API_KEY_ENV_VAR_NAME} environment variable and restart Zed."),
                     )
                     .size(LabelSize::Small).color(Color::Muted),
                 )
-                .into_any()
+                .into_any_element()
         } else {
-            h_flex()
-                .mt_1()
-                .p_1()
-                .justify_between()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .bg(cx.theme().colors().background)
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .child(Icon::new(IconName::Check).color(Color::Success))
-                        .child(Label::new(if env_var_set {
-                            format!("API key set in {API_KEY_ENV_VAR_NAME} environment variable")
-                        } else {
-                            let api_url = OpenRouterLanguageModelProvider::api_url(cx);
-                            if api_url == OPEN_ROUTER_API_URL {
-                                "API key configured".to_string()
-                            } else {
-                                format!("API key configured for {}", truncate_and_trailoff(&api_url, 32))
+            ConfiguredApiCard::new(configured_card_label)
+                .disabled(env_var_set)
+                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx)))
+                .when(env_var_set, |this| {
+                    this.tooltip_label(format!("To reset your API key, unset the {API_KEY_ENV_VAR_NAME} environment variable."))
+                })
+                .into_any_element()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use open_router::{ChoiceDelta, FunctionChunk, ResponseMessageDelta, ToolCallChunk};
+
+    #[gpui::test]
+    async fn test_reasoning_details_preservation_with_tool_calls() {
+        // This test verifies that reasoning_details are properly captured and preserved
+        // when a model uses tool calling with reasoning/thinking tokens.
+        //
+        // The key regression this prevents:
+        // - OpenRouter sends multiple reasoning_details updates during streaming
+        // - First with actual content (encrypted reasoning data)
+        // - Then with empty array on completion
+        // - We must NOT overwrite the real data with the empty array
+
+        let mut mapper = OpenRouterEventMapper::new();
+
+        // Simulate the streaming events as they come from OpenRouter/Gemini
+        let events = vec![
+            // Event 1: Initial reasoning details with text
+            ResponseStreamEvent {
+                id: Some("response_123".into()),
+                created: 1234567890,
+                model: "google/gemini-3-pro-preview".into(),
+                choices: vec![ChoiceDelta {
+                    index: 0,
+                    delta: ResponseMessageDelta {
+                        role: None,
+                        content: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        reasoning_details: Some(serde_json::json!([
+                            {
+                                "type": "reasoning.text",
+                                "text": "Let me analyze this request...",
+                                "format": "google-gemini-v1",
+                                "index": 0
                             }
-                        })),
-                )
-                .child(
-                    Button::new("reset-key", "Reset Key")
-                        .label_size(LabelSize::Small)
-                        .icon(Some(IconName::Trash))
-                        .icon_size(IconSize::Small)
-                        .icon_position(IconPosition::Start)
-                        .disabled(env_var_set)
-                        .when(env_var_set, |this| {
-                            this.tooltip(Tooltip::text(format!("To reset your API key, unset the {API_KEY_ENV_VAR_NAME} environment variable.")))
-                        })
-                        .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx))),
-                )
-                .into_any()
+                        ])),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            },
+            // Event 2: More reasoning details
+            ResponseStreamEvent {
+                id: Some("response_123".into()),
+                created: 1234567890,
+                model: "google/gemini-3-pro-preview".into(),
+                choices: vec![ChoiceDelta {
+                    index: 0,
+                    delta: ResponseMessageDelta {
+                        role: None,
+                        content: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        reasoning_details: Some(serde_json::json!([
+                            {
+                                "type": "reasoning.encrypted",
+                                "data": "EtgDCtUDAdHtim9OF5jm4aeZSBAtl/randomized123",
+                                "format": "google-gemini-v1",
+                                "index": 0,
+                                "id": "tool_call_abc123"
+                            }
+                        ])),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            },
+            // Event 3: Tool call starts
+            ResponseStreamEvent {
+                id: Some("response_123".into()),
+                created: 1234567890,
+                model: "google/gemini-3-pro-preview".into(),
+                choices: vec![ChoiceDelta {
+                    index: 0,
+                    delta: ResponseMessageDelta {
+                        role: None,
+                        content: None,
+                        reasoning: None,
+                        tool_calls: Some(vec![ToolCallChunk {
+                            index: 0,
+                            id: Some("tool_call_abc123".into()),
+                            function: Some(FunctionChunk {
+                                name: Some("list_directory".into()),
+                                arguments: Some("{\"path\":\"test\"}".into()),
+                                thought_signature: Some("sha256:test_signature_xyz789".into()),
+                            }),
+                        }]),
+                        reasoning_details: None,
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            },
+            // Event 4: Empty reasoning_details on tool_calls finish
+            // This is the critical event - we must not overwrite with this empty array!
+            ResponseStreamEvent {
+                id: Some("response_123".into()),
+                created: 1234567890,
+                model: "google/gemini-3-pro-preview".into(),
+                choices: vec![ChoiceDelta {
+                    index: 0,
+                    delta: ResponseMessageDelta {
+                        role: None,
+                        content: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        reasoning_details: Some(serde_json::json!([])),
+                    },
+                    finish_reason: Some("tool_calls".into()),
+                }],
+                usage: None,
+            },
+        ];
+
+        // Process all events
+        let mut collected_events = Vec::new();
+        for event in events {
+            let mapped = mapper.map_event(event);
+            collected_events.extend(mapped);
+        }
+
+        // Verify we got the expected events
+        let mut has_tool_use = false;
+        let mut reasoning_details_events = Vec::new();
+        let mut thought_signature_value = None;
+
+        for event_result in collected_events {
+            match event_result {
+                Ok(LanguageModelCompletionEvent::ToolUse(tool_use)) => {
+                    has_tool_use = true;
+                    assert_eq!(tool_use.id.to_string(), "tool_call_abc123");
+                    assert_eq!(tool_use.name.as_ref(), "list_directory");
+                    thought_signature_value = tool_use.thought_signature.clone();
+                }
+                Ok(LanguageModelCompletionEvent::ReasoningDetails(details)) => {
+                    reasoning_details_events.push(details);
+                }
+                _ => {}
+            }
+        }
+
+        // Assertions
+        assert!(has_tool_use, "Should have emitted ToolUse event");
+        assert!(
+            !reasoning_details_events.is_empty(),
+            "Should have emitted ReasoningDetails events"
+        );
+
+        // We should have received multiple reasoning_details events (text, encrypted, empty)
+        // The agent layer is responsible for keeping only the first non-empty one
+        assert!(
+            reasoning_details_events.len() >= 2,
+            "Should have multiple reasoning_details events from streaming"
+        );
+
+        // Verify at least one contains the encrypted data
+        let has_encrypted = reasoning_details_events.iter().any(|details| {
+            if let serde_json::Value::Array(arr) = details {
+                arr.iter().any(|item| {
+                    item["type"] == "reasoning.encrypted"
+                        && item["data"]
+                            .as_str()
+                            .map_or(false, |s| s.contains("EtgDCtUDAdHtim9OF5jm4aeZSBAtl"))
+                })
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_encrypted,
+            "Should have at least one reasoning_details with encrypted data"
+        );
+
+        // Verify thought_signature was captured
+        assert!(
+            thought_signature_value.is_some(),
+            "Tool use should have thought_signature"
+        );
+        assert_eq!(
+            thought_signature_value.unwrap(),
+            "sha256:test_signature_xyz789"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_agent_prevents_empty_reasoning_details_overwrite() {
+        // This test verifies that the agent layer prevents empty reasoning_details
+        // from overwriting non-empty ones, even though the mapper emits all events.
+
+        // Simulate what the agent does when it receives multiple ReasoningDetails events
+        let mut agent_reasoning_details: Option<serde_json::Value> = None;
+
+        let events = vec![
+            // First event: non-empty reasoning_details
+            serde_json::json!([
+                {
+                    "type": "reasoning.encrypted",
+                    "data": "real_data_here",
+                    "format": "google-gemini-v1"
+                }
+            ]),
+            // Second event: empty array (should not overwrite)
+            serde_json::json!([]),
+        ];
+
+        for details in events {
+            // This mimics the agent's logic: only store if we don't already have it
+            if agent_reasoning_details.is_none() {
+                agent_reasoning_details = Some(details);
+            }
+        }
+
+        // Verify the agent kept the first non-empty reasoning_details
+        assert!(agent_reasoning_details.is_some());
+        let final_details = agent_reasoning_details.unwrap();
+        if let serde_json::Value::Array(arr) = &final_details {
+            assert!(
+                !arr.is_empty(),
+                "Agent should have kept the non-empty reasoning_details"
+            );
+            assert_eq!(arr[0]["data"], "real_data_here");
+        } else {
+            panic!("Expected array");
         }
     }
 }

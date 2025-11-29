@@ -7,7 +7,7 @@ mod terminal_slash_command;
 pub mod terminal_tab_tooltip;
 
 use assistant_slash_command::SlashCommandRegistry;
-use editor::{EditorSettings, actions::SelectAll};
+use editor::{EditorSettings, actions::SelectAll, blink_manager::BlinkManager};
 use gpui::{
     Action, AnyElement, App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, Pixels, Render,
@@ -25,7 +25,7 @@ use terminal::{
         index::Point,
         term::{TermMode, point_to_viewport, search::RegexSearch},
     },
-    terminal_settings::{self, CursorShape, TerminalBlink, TerminalSettings, WorkingDirectory},
+    terminal_settings::{CursorShape, TerminalSettings},
 };
 use terminal_element::TerminalElement;
 use terminal_panel::TerminalPanel;
@@ -50,8 +50,7 @@ use workspace::{
 };
 
 use serde::Deserialize;
-use settings::{Settings, SettingsStore};
-use smol::Timer;
+use settings::{Settings, SettingsStore, TerminalBlink, WorkingDirectory};
 use zed_actions::assistant::InlineAssist;
 
 use std::{
@@ -95,7 +94,6 @@ actions!(
 pub fn init(cx: &mut App) {
     assistant_slash_command::init(cx);
     terminal_panel::init(cx);
-    terminal::init(cx);
 
     register_serializable_item::<TerminalView>(cx);
 
@@ -127,12 +125,10 @@ pub struct TerminalView {
     has_bell: bool,
     context_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     cursor_shape: CursorShape,
-    blink_state: bool,
+    blink_manager: Entity<BlinkManager>,
     mode: TerminalMode,
     blinking_terminal_enabled: bool,
     cwd_serialized: bool,
-    blinking_paused: bool,
-    blink_epoch: usize,
     hover: Option<HoverTarget>,
     hover_tooltip_update: Task<()>,
     workspace_id: Option<WorkspaceId>,
@@ -234,12 +230,29 @@ impl TerminalView {
                 terminal_view.focus_out(window, cx);
             },
         );
-        let cursor_shape = TerminalSettings::get_global(cx)
-            .cursor_shape
-            .unwrap_or_default();
+        let cursor_shape = TerminalSettings::get_global(cx).cursor_shape;
 
         let scroll_handle = TerminalScrollHandle::new(terminal.read(cx));
 
+        let blink_manager = cx.new(|cx| {
+            BlinkManager::new(
+                CURSOR_BLINK_INTERVAL,
+                |cx| {
+                    !matches!(
+                        TerminalSettings::get_global(cx).blinking,
+                        TerminalBlink::Off
+                    )
+                },
+                cx,
+            )
+        });
+
+        let _subscriptions = vec![
+            focus_in,
+            focus_out,
+            cx.observe(&blink_manager, |_, _, cx| cx.notify()),
+            cx.observe_global::<SettingsStore>(Self::settings_changed),
+        ];
         Self {
             terminal,
             workspace: workspace_handle,
@@ -248,10 +261,8 @@ impl TerminalView {
             focus_handle,
             context_menu: None,
             cursor_shape,
-            blink_state: true,
+            blink_manager,
             blinking_terminal_enabled: false,
-            blinking_paused: false,
-            blink_epoch: 0,
             hover: None,
             hover_tooltip_update: Task::ready(()),
             mode: TerminalMode::Standalone,
@@ -262,11 +273,7 @@ impl TerminalView {
             scroll_handle,
             cwd_serialized: false,
             ime_state: None,
-            _subscriptions: vec![
-                focus_in,
-                focus_out,
-                cx.observe_global::<SettingsStore>(Self::settings_changed),
-            ],
+            _subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
     }
@@ -427,7 +434,12 @@ impl TerminalView {
         let breadcrumb_visibility_changed = self.show_breadcrumbs != settings.toolbar.breadcrumbs;
         self.show_breadcrumbs = settings.toolbar.breadcrumbs;
 
-        let new_cursor_shape = settings.cursor_shape.unwrap_or_default();
+        let should_blink = match settings.blinking {
+            TerminalBlink::Off => false,
+            TerminalBlink::On => true,
+            TerminalBlink::TerminalControlled => self.blinking_terminal_enabled,
+        };
+        let new_cursor_shape = settings.cursor_shape;
         let old_cursor_shape = self.cursor_shape;
         if old_cursor_shape != new_cursor_shape {
             self.cursor_shape = new_cursor_shape;
@@ -435,6 +447,15 @@ impl TerminalView {
                 term.set_cursor_shape(self.cursor_shape);
             });
         }
+
+        self.blink_manager.update(
+            cx,
+            if should_blink {
+                BlinkManager::enable
+            } else {
+                BlinkManager::disable
+            },
+        );
 
         if breadcrumb_visibility_changed {
             cx.emit(ItemEvent::UpdateBreadcrumbs);
@@ -476,7 +497,7 @@ impl TerminalView {
             .terminal
             .read(cx)
             .task()
-            .map(|task| terminal_rerun_override(&task.id))
+            .map(|task| terminal_rerun_override(&task.spawned_task.id))
             .unwrap_or_default();
         window.dispatch_action(Box::new(task), cx);
     }
@@ -522,7 +543,12 @@ impl TerminalView {
                 return;
             }
         }
-        self.terminal.update(cx, |term, _| term.scroll_wheel(event));
+        self.terminal.update(cx, |term, cx| {
+            term.scroll_wheel(
+                event,
+                TerminalSettings::get_global(cx).scroll_multiplier.max(0.01),
+            )
+        });
     }
 
     fn scroll_line_up(&mut self, _: &ScrollLineUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -608,9 +634,8 @@ impl TerminalView {
     }
 
     pub fn should_show_cursor(&self, focused: bool, cx: &mut Context<Self>) -> bool {
-        //Don't blink the cursor when not focused, blinking is disabled, or paused
+        // Always show cursor when not focused or in special modes
         if !focused
-            || self.blinking_paused
             || self
                 .terminal
                 .read(cx)
@@ -621,45 +646,18 @@ impl TerminalView {
             return true;
         }
 
+        // When focused, check blinking settings and blink manager state
         match TerminalSettings::get_global(cx).blinking {
-            //If the user requested to never blink, don't blink it.
             TerminalBlink::Off => true,
-            //If the terminal is controlling it, check terminal mode
             TerminalBlink::TerminalControlled => {
-                !self.blinking_terminal_enabled || self.blink_state
+                !self.blinking_terminal_enabled || self.blink_manager.read(cx).visible()
             }
-            TerminalBlink::On => self.blink_state,
+            TerminalBlink::On => self.blink_manager.read(cx).visible(),
         }
     }
 
-    fn blink_cursors(&mut self, epoch: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if epoch == self.blink_epoch && !self.blinking_paused {
-            self.blink_state = !self.blink_state;
-            cx.notify();
-
-            let epoch = self.next_blink_epoch();
-            cx.spawn_in(window, async move |this, cx| {
-                Timer::after(CURSOR_BLINK_INTERVAL).await;
-                this.update_in(cx, |this, window, cx| this.blink_cursors(epoch, window, cx))
-                    .ok();
-            })
-            .detach();
-        }
-    }
-
-    pub fn pause_cursor_blinking(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.blink_state = true;
-        cx.notify();
-
-        let epoch = self.next_blink_epoch();
-        cx.spawn_in(window, async move |this, cx| {
-            Timer::after(CURSOR_BLINK_INTERVAL).await;
-            this.update_in(cx, |this, window, cx| {
-                this.resume_cursor_blinking(epoch, window, cx)
-            })
-            .ok();
-        })
-        .detach();
+    pub fn pause_cursor_blinking(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.blink_manager.update(cx, BlinkManager::pause_blinking);
     }
 
     pub fn terminal(&self) -> &Entity<Terminal> {
@@ -681,23 +679,6 @@ impl TerminalView {
         self.block_below_cursor = None;
         self.scroll_top = Pixels::ZERO;
         cx.notify();
-    }
-
-    fn next_blink_epoch(&mut self) -> usize {
-        self.blink_epoch += 1;
-        self.blink_epoch
-    }
-
-    fn resume_cursor_blinking(
-        &mut self,
-        epoch: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if epoch == self.blink_epoch {
-            self.blinking_paused = false;
-            self.blink_cursors(epoch, window, cx);
-        }
     }
 
     ///Attempt to paste the clipboard into the terminal
@@ -831,20 +812,18 @@ impl TerminalView {
     }
 
     fn rerun_button(task: &TaskState) -> Option<IconButton> {
-        if !task.show_rerun {
+        if !task.spawned_task.show_rerun {
             return None;
         }
 
-        let task_id = task.id.clone();
+        let task_id = task.spawned_task.id.clone();
         Some(
             IconButton::new("rerun-icon", IconName::Rerun)
                 .icon_size(IconSize::Small)
                 .size(ButtonSize::Compact)
                 .icon_color(Color::Default)
                 .shape(ui::IconButtonShape::Square)
-                .tooltip(move |window, cx| {
-                    Tooltip::for_action("Rerun task", &RerunTask, window, cx)
-                })
+                .tooltip(move |_window, cx| Tooltip::for_action("Rerun task", &RerunTask, cx))
                 .on_click(move |_, window, cx| {
                     window.dispatch_action(Box::new(terminal_rerun_override(&task_id)), cx);
                 }),
@@ -893,11 +872,21 @@ fn subscribe_for_terminal_events(
                 }
 
                 Event::BlinkChanged(blinking) => {
+                    terminal_view.blinking_terminal_enabled = *blinking;
+
+                    // If in terminal-controlled mode and focused, update blink manager
                     if matches!(
                         TerminalSettings::get_global(cx).blinking,
                         TerminalBlink::TerminalControlled
-                    ) {
-                        terminal_view.blinking_terminal_enabled = *blinking;
+                    ) && terminal_view.focus_handle.is_focused(window)
+                    {
+                        terminal_view.blink_manager.update(cx, |manager, cx| {
+                            if *blinking {
+                                manager.enable(cx);
+                            } else {
+                                manager.disable(cx);
+                            }
+                        });
                     }
                 }
 
@@ -997,12 +986,7 @@ impl ScrollbarVisibility for TerminalScrollbarSettingsWrapper {
         TerminalSettings::get_global(cx)
             .scrollbar
             .show
-            .map(|value| match value {
-                terminal_settings::ShowScrollbar::Auto => scrollbars::ShowScrollbar::Auto,
-                terminal_settings::ShowScrollbar::System => scrollbars::ShowScrollbar::System,
-                terminal_settings::ShowScrollbar::Always => scrollbars::ShowScrollbar::Always,
-                terminal_settings::ShowScrollbar::Never => scrollbars::ShowScrollbar::Never,
-            })
+            .map(Into::into)
             .unwrap_or_else(|| EditorSettings::get_global(cx).scrollbar.show)
     }
 }
@@ -1028,12 +1012,23 @@ impl TerminalView {
             terminal.set_cursor_shape(self.cursor_shape);
             terminal.focus_in();
         });
-        self.blink_cursors(self.blink_epoch, window, cx);
+
+        let should_blink = match TerminalSettings::get_global(cx).blinking {
+            TerminalBlink::Off => false,
+            TerminalBlink::On => true,
+            TerminalBlink::TerminalControlled => self.blinking_terminal_enabled,
+        };
+
+        if should_blink {
+            self.blink_manager.update(cx, BlinkManager::enable);
+        }
+
         window.invalidate_character_coordinates();
         cx.notify();
     }
 
-    fn focus_out(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+    fn focus_out(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.blink_manager.update(cx, BlinkManager::disable);
         self.terminal.update(cx, |terminal, _| {
             terminal.focus_out();
             terminal.set_cursor_shape(CursorShape::Hollow);
@@ -1123,7 +1118,7 @@ impl Render for TerminalView {
                                     ScrollAxes::Vertical,
                                     cx.theme().colors().editor_background,
                                 )
-                                .tracked_scroll_handle(self.scroll_handle.clone()),
+                                .tracked_scroll_handle(&self.scroll_handle),
                             window,
                             cx,
                         )
@@ -1147,10 +1142,11 @@ impl Item for TerminalView {
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
         let terminal = self.terminal().read(cx);
         let title = terminal.title(false);
-        let pid = terminal.pty_info.pid_getter().fallback_pid();
+        let pid = terminal.pid_getter()?.fallback_pid();
 
         Some(TabTooltipContent::Custom(Box::new(move |_window, cx| {
-            cx.new(|_| TerminalTooltip::new(title.clone(), pid)).into()
+            cx.new(|_| TerminalTooltip::new(title.clone(), pid.as_u32()))
+                .into()
         })))
     }
 
@@ -1218,33 +1214,44 @@ impl Item for TerminalView {
         None
     }
 
+    fn buffer_kind(&self, _: &App) -> workspace::item::ItemBufferKind {
+        workspace::item::ItemBufferKind::Singleton
+    }
+
+    fn can_split(&self) -> bool {
+        true
+    }
+
     fn clone_on_split(
         &self,
         workspace_id: Option<WorkspaceId>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<Entity<Self>> {
-        let terminal = self
-            .project
-            .update(cx, |project, cx| {
-                let cwd = project
-                    .active_project_directory(cx)
-                    .map(|it| it.to_path_buf());
-                project.clone_terminal(self.terminal(), cx, || cwd)
+    ) -> Task<Option<Entity<Self>>> {
+        let Ok(terminal) = self.project.update(cx, |project, cx| {
+            let cwd = project
+                .active_project_directory(cx)
+                .map(|it| it.to_path_buf());
+            project.clone_terminal(self.terminal(), cx, cwd)
+        }) else {
+            return Task::ready(None);
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let terminal = terminal.await.log_err()?;
+            this.update_in(cx, |this, window, cx| {
+                cx.new(|cx| {
+                    TerminalView::new(
+                        terminal,
+                        this.workspace.clone(),
+                        workspace_id,
+                        this.project.clone(),
+                        window,
+                        cx,
+                    )
+                })
             })
-            .ok()?
-            .log_err()?;
-
-        Some(cx.new(|cx| {
-            TerminalView::new(
-                terminal,
-                self.workspace.clone(),
-                workspace_id,
-                self.project.clone(),
-                window,
-                cx,
-            )
-        }))
+            .ok()
+        })
     }
 
     fn is_dirty(&self, cx: &gpui::App) -> bool {
@@ -1260,10 +1267,6 @@ impl Item for TerminalView {
 
     fn can_save_as(&self, _cx: &App) -> bool {
         false
-    }
-
-    fn is_singleton(&self, _cx: &App) -> bool {
-        true
     }
 
     fn as_searchable(&self, handle: &Entity<Self>) -> Option<Box<dyn SearchableItemHandle>> {
@@ -1553,7 +1556,8 @@ pub(crate) fn default_working_directory(workspace: &Workspace, cx: &App) -> Opti
             .read(cx)
             .active_project_directory(cx)
             .as_deref()
-            .map(Path::to_path_buf),
+            .map(Path::to_path_buf)
+            .or_else(|| first_project_directory(workspace, cx)),
         WorkingDirectory::FirstProjectDirectory => first_project_directory(workspace, cx),
         WorkingDirectory::AlwaysHome => None,
         WorkingDirectory::Always { directory } => {
@@ -1567,10 +1571,13 @@ pub(crate) fn default_working_directory(workspace: &Workspace, cx: &App) -> Opti
 ///Gets the first project's home directory, or the home directory
 fn first_project_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
     let worktree = workspace.worktrees(cx).next()?.read(cx);
-    if !worktree.root_entry()?.is_dir() {
-        return None;
+    let worktree_path = worktree.abs_path();
+    if worktree.root_entry()?.is_dir() {
+        Some(worktree_path.to_path_buf())
+    } else {
+        // If worktree is a file, return its parent directory
+        worktree_path.parent().map(|p| p.to_path_buf())
     }
-    Some(worktree.abs_path().to_path_buf())
 }
 
 #[cfg(test)]
@@ -1579,6 +1586,7 @@ mod tests {
     use gpui::TestAppContext;
     use project::{Entry, Project, ProjectPath, Worktree};
     use std::path::Path;
+    use util::rel_path::RelPath;
     use workspace::AppState;
 
     // Working directory calculation tests
@@ -1602,7 +1610,7 @@ mod tests {
         });
     }
 
-    // No active entry, but a worktree, worktree is a file -> home_dir()
+    // No active entry, but a worktree, worktree is a file -> parent directory
     #[gpui::test]
     async fn no_active_entry_worktree_is_file(cx: &mut TestAppContext) {
         let (project, workspace) = init_test(cx).await;
@@ -1617,9 +1625,9 @@ mod tests {
             assert!(workspace.worktrees(cx).next().is_some());
 
             let res = default_working_directory(workspace, cx);
-            assert_eq!(res, None);
+            assert_eq!(res, Some(Path::new("/").to_path_buf()));
             let res = first_project_directory(workspace, cx);
-            assert_eq!(res, None);
+            assert_eq!(res, Some(Path::new("/").to_path_buf()));
         });
     }
 
@@ -1691,10 +1699,7 @@ mod tests {
     pub async fn init_test(cx: &mut TestAppContext) -> (Entity<Project>, Entity<Workspace>) {
         let params = cx.update(AppState::test);
         cx.update(|cx| {
-            terminal::init(cx);
             theme::init(theme::LoadThemes::JustBase, cx);
-            Project::init_settings(cx);
-            language::init(cx);
         });
 
         let project = Project::test(params.fs.clone(), [], cx).await;
@@ -1740,7 +1745,7 @@ mod tests {
         let entry = cx
             .update(|cx| {
                 wt.update(cx, |wt, cx| {
-                    wt.create_entry(Path::new(""), is_dir, None, cx)
+                    wt.create_entry(RelPath::empty().into(), is_dir, None, cx)
                 })
             })
             .await

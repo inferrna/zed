@@ -22,19 +22,23 @@ mod toolchain;
 #[cfg(test)]
 pub mod buffer_tests;
 
-pub use crate::language_settings::EditPredictionsMode;
 use crate::language_settings::SoftWrap;
+pub use crate::language_settings::{EditPredictionsMode, IndentGuideSettings};
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use collections::{HashMap, HashSet, IndexSet};
 use futures::Future;
+use futures::future::LocalBoxFuture;
+use futures::lock::OwnedMutexGuard;
 use gpui::{App, AsyncApp, Entity, SharedString};
 pub use highlight_map::HighlightMap;
 use http_client::HttpClient;
 pub use language_registry::{
     LanguageName, LanguageServerStatusUpdate, LoadedLanguage, ServerHealth,
 };
-use lsp::{CodeActionKind, InitializeParams, LanguageServerBinary, LanguageServerBinaryOptions};
+use lsp::{
+    CodeActionKind, InitializeParams, LanguageServerBinary, LanguageServerBinaryOptions, Uri,
+};
 pub use manifest::{ManifestDelegate, ManifestName, ManifestProvider, ManifestQuery};
 use parking_lot::Mutex;
 use regex::Regex;
@@ -51,11 +55,10 @@ use std::{
     mem,
     ops::{DerefMut, Range},
     path::{Path, PathBuf},
-    pin::Pin,
     str,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
+        atomic::{AtomicUsize, Ordering::SeqCst},
     },
 };
 use syntax_map::{QueryCursorHandle, SyntaxSnapshot};
@@ -70,27 +73,23 @@ pub use toolchain::{
     ToolchainMetadata, ToolchainScope,
 };
 use tree_sitter::{self, Query, QueryCursor, WasmStore, wasmtime};
+use util::rel_path::RelPath;
 use util::serde::default_true;
 
 pub use buffer::Operation;
 pub use buffer::*;
-pub use diagnostic_set::{DiagnosticEntry, DiagnosticGroup};
+pub use diagnostic_set::{DiagnosticEntry, DiagnosticEntryRef, DiagnosticGroup};
 pub use language_registry::{
     AvailableLanguage, BinaryStatus, LanguageNotFound, LanguageQueries, LanguageRegistry,
     QUERY_FILENAME_PREFIXES,
 };
 pub use lsp::{LanguageServerId, LanguageServerName};
 pub use outline::*;
-pub use syntax_map::{OwnedSyntaxLayer, SyntaxLayer, ToTreeSitterPoint, TreeSitterOptions};
+pub use syntax_map::{
+    OwnedSyntaxLayer, SyntaxLayer, SyntaxMapMatches, ToTreeSitterPoint, TreeSitterOptions,
+};
 pub use text::{AnchorRangeExt, LineEnding};
 pub use tree_sitter::{Node, Parser, Tree, TreeCursor};
-
-/// Initializes the `language` crate.
-///
-/// This should be called before making use of items from the create.
-pub fn init(cx: &mut App) {
-    language_settings::init(cx);
-}
 
 static QUERY_CURSORS: Mutex<Vec<QueryCursor>> = Mutex::new(vec![]);
 static PARSERS: Mutex<Vec<Parser>> = Mutex::new(vec![]);
@@ -156,7 +155,14 @@ pub struct Location {
 }
 
 type ServerBinaryCache = futures::lock::Mutex<Option<(bool, LanguageServerBinary)>>;
-
+type DownloadableLanguageServerBinary = LocalBoxFuture<'static, Result<LanguageServerBinary>>;
+pub type LanguageServerBinaryLocations = LocalBoxFuture<
+    'static,
+    (
+        Result<LanguageServerBinary>,
+        Option<DownloadableLanguageServerBinary>,
+    ),
+>;
 /// Represents a Language Server, with certain cached sync properties.
 /// Uses [`LspAdapter`] under the hood, but calls all 'static' methods
 /// once at startup, and caches the results.
@@ -166,8 +172,7 @@ pub struct CachedLspAdapter {
     pub disk_based_diagnostics_progress_token: Option<String>,
     language_ids: HashMap<LanguageName, String>,
     pub adapter: Arc<dyn LspAdapter>,
-    pub reinstall_attempt_count: AtomicU64,
-    cached_binary: ServerBinaryCache,
+    cached_binary: Arc<ServerBinaryCache>,
 }
 
 impl Debug for CachedLspAdapter {
@@ -183,7 +188,6 @@ impl Debug for CachedLspAdapter {
                 &self.disk_based_diagnostics_progress_token,
             )
             .field("language_ids", &self.language_ids)
-            .field("reinstall_attempt_count", &self.reinstall_attempt_count)
             .finish_non_exhaustive()
     }
 }
@@ -202,7 +206,6 @@ impl CachedLspAdapter {
             language_ids,
             adapter,
             cached_binary: Default::default(),
-            reinstall_attempt_count: AtomicU64::new(0),
         })
     }
 
@@ -216,18 +219,15 @@ impl CachedLspAdapter {
         toolchains: Option<Toolchain>,
         binary_options: LanguageServerBinaryOptions,
         cx: &mut AsyncApp,
-    ) -> Result<LanguageServerBinary> {
-        let mut cached_binary = self.cached_binary.lock().await;
-        self.adapter
-            .clone()
-            .get_language_server_command(
-                delegate,
-                toolchains,
-                binary_options,
-                &mut cached_binary,
-                cx,
-            )
-            .await
+    ) -> LanguageServerBinaryLocations {
+        let cached_binary = self.cached_binary.clone().lock_owned().await;
+        self.adapter.clone().get_language_server_command(
+            delegate,
+            toolchains,
+            binary_options,
+            cached_binary,
+            cx.clone(),
+        )
     }
 
     pub fn code_action_kinds(&self) -> Option<Vec<CodeActionKind>> {
@@ -298,6 +298,7 @@ pub trait LspAdapterDelegate: Send + Sync {
     fn http_client(&self) -> Arc<dyn HttpClient>;
     fn worktree_id(&self) -> WorktreeId;
     fn worktree_root_path(&self) -> &Path;
+    fn resolve_executable_path(&self, path: PathBuf) -> PathBuf;
     fn update_status(&self, language: LanguageServerName, status: BinaryStatus);
     fn registered_lsp_adapters(&self) -> Vec<Arc<dyn LspAdapter>>;
     async fn language_server_download_dir(&self, name: &LanguageServerName) -> Option<Arc<Path>>;
@@ -308,7 +309,7 @@ pub trait LspAdapterDelegate: Send + Sync {
     ) -> Result<Option<(PathBuf, String)>>;
     async fn which(&self, command: &OsStr) -> Option<PathBuf>;
     async fn shell_env(&self) -> HashMap<String, String>;
-    async fn read_text_file(&self, path: PathBuf) -> Result<String>;
+    async fn read_text_file(&self, path: &RelPath) -> Result<String>;
     async fn try_exec(&self, binary: LanguageServerBinary) -> Result<()>;
 }
 
@@ -407,6 +408,7 @@ pub trait LspAdapter: 'static + Send + Sync + DynLspInstaller {
         self: Arc<Self>,
         _: &Arc<dyn LspAdapterDelegate>,
         _: Option<Toolchain>,
+        _: Option<Uri>,
         _cx: &mut AsyncApp,
     ) -> Result<Value> {
         Ok(serde_json::json!({}))
@@ -461,17 +463,6 @@ pub trait LspAdapter: 'static + Send + Sync + DynLspInstaller {
     /// files
     fn is_primary_zed_json_schema_adapter(&self) -> bool {
         false
-    }
-
-    /// Method only implemented by the default JSON language server adapter.
-    /// Used to clear the cache of JSON schemas that are used to provide
-    /// autocompletion and diagnostics in Zed settings and keybinds files.
-    /// Should not be called unless the callee is sure that
-    /// `Self::is_primary_zed_json_schema_adapter` returns `true`
-    async fn clear_zed_json_schema_cache(&self) {
-        unreachable!(
-            "Not implemented for this adapter. This method should only be called on the default JSON language server adapter"
-        );
     }
 
     /// True for the extension adapter and false otherwise.
@@ -530,14 +521,14 @@ pub trait DynLspInstaller {
         pre_release: bool,
         cx: &mut AsyncApp,
     ) -> Result<LanguageServerBinary>;
-    fn get_language_server_command<'a>(
+    fn get_language_server_command(
         self: Arc<Self>,
         delegate: Arc<dyn LspAdapterDelegate>,
         toolchains: Option<Toolchain>,
         binary_options: LanguageServerBinaryOptions,
-        cached_binary: &'a mut Option<(bool, LanguageServerBinary)>,
-        cx: &'a mut AsyncApp,
-    ) -> Pin<Box<dyn 'a + Future<Output = Result<LanguageServerBinary>>>>;
+        cached_binary: OwnedMutexGuard<Option<(bool, LanguageServerBinary)>>,
+        cx: AsyncApp,
+    ) -> LanguageServerBinaryLocations;
 }
 
 #[async_trait(?Send)]
@@ -579,15 +570,16 @@ where
             binary
         }
     }
-    fn get_language_server_command<'a>(
+    fn get_language_server_command(
         self: Arc<Self>,
         delegate: Arc<dyn LspAdapterDelegate>,
         toolchain: Option<Toolchain>,
         binary_options: LanguageServerBinaryOptions,
-        cached_binary: &'a mut Option<(bool, LanguageServerBinary)>,
-        cx: &'a mut AsyncApp,
-    ) -> Pin<Box<dyn 'a + Future<Output = Result<LanguageServerBinary>>>> {
+        mut cached_binary: OwnedMutexGuard<Option<(bool, LanguageServerBinary)>>,
+        mut cx: AsyncApp,
+    ) -> LanguageServerBinaryLocations {
         async move {
+            let cached_binary_deref = cached_binary.deref_mut();
             // First we check whether the adapter can give us a user-installed binary.
             // If so, we do *not* want to cache that, because each worktree might give us a different
             // binary:
@@ -601,7 +593,7 @@ where
             // for each worktree we might have open.
             if binary_options.allow_path_lookup
                 && let Some(binary) = self
-                    .check_if_user_installed(delegate.as_ref(), toolchain, cx)
+                    .check_if_user_installed(delegate.as_ref(), toolchain, &mut cx)
                     .await
             {
                 log::info!(
@@ -610,62 +602,77 @@ where
                     binary.path,
                     binary.arguments
                 );
-                return Ok(binary);
+                return (Ok(binary), None);
             }
 
-            anyhow::ensure!(
-                binary_options.allow_binary_download,
-                "downloading language servers disabled"
-            );
+            if !binary_options.allow_binary_download {
+                return (
+                    Err(anyhow::anyhow!("downloading language servers disabled")),
+                    None,
+                );
+            }
 
-            if let Some((pre_release, cached_binary)) = cached_binary
+            if let Some((pre_release, cached_binary)) = cached_binary_deref
                 && *pre_release == binary_options.pre_release
             {
-                return Ok(cached_binary.clone());
+                return (Ok(cached_binary.clone()), None);
             }
 
             let Some(container_dir) = delegate.language_server_download_dir(&self.name()).await
             else {
-                anyhow::bail!("no language server download dir defined")
+                return (
+                    Err(anyhow::anyhow!("no language server download dir defined")),
+                    None,
+                );
             };
 
-            let mut binary = self
-                .try_fetch_server_binary(
-                    &delegate,
-                    container_dir.to_path_buf(),
-                    binary_options.pre_release,
-                    cx,
-                )
-                .await;
+            let last_downloaded_binary = self
+                .cached_server_binary(container_dir.to_path_buf(), delegate.as_ref())
+                .await
+                .context(
+                    "did not find existing language server binary, falling back to downloading",
+                );
+            let download_binary = async move {
+                let mut binary = self
+                    .try_fetch_server_binary(
+                        &delegate,
+                        container_dir.to_path_buf(),
+                        binary_options.pre_release,
+                        &mut cx,
+                    )
+                    .await;
 
-            if let Err(error) = binary.as_ref() {
-                if let Some(prev_downloaded_binary) = self
-                    .cached_server_binary(container_dir.to_path_buf(), delegate.as_ref())
-                    .await
-                {
-                    log::info!(
-                        "failed to fetch newest version of language server {:?}. \
-                        error: {:?}, falling back to using {:?}",
-                        self.name(),
-                        error,
-                        prev_downloaded_binary.path
-                    );
-                    binary = Ok(prev_downloaded_binary);
-                } else {
-                    delegate.update_status(
-                        self.name(),
-                        BinaryStatus::Failed {
-                            error: format!("{error:?}"),
-                        },
-                    );
+                if let Err(error) = binary.as_ref() {
+                    if let Some(prev_downloaded_binary) = self
+                        .cached_server_binary(container_dir.to_path_buf(), delegate.as_ref())
+                        .await
+                    {
+                        log::info!(
+                            "failed to fetch newest version of language server {:?}. \
+                            error: {:?}, falling back to using {:?}",
+                            self.name(),
+                            error,
+                            prev_downloaded_binary.path
+                        );
+                        binary = Ok(prev_downloaded_binary);
+                    } else {
+                        delegate.update_status(
+                            self.name(),
+                            BinaryStatus::Failed {
+                                error: format!("{error:?}"),
+                            },
+                        );
+                    }
                 }
-            }
 
-            if let Ok(binary) = &binary {
-                *cached_binary = Some((binary_options.pre_release, binary.clone()));
-            }
+                if let Ok(binary) = &binary {
+                    *cached_binary = Some((binary_options.pre_release, binary.clone()));
+                }
 
-            binary
+                binary
+            }
+            .boxed_local();
+            (last_downloaded_binary, Some(download_binary))
         }
         .boxed_local()
     }
@@ -681,7 +688,17 @@ pub struct CodeLabel {
     pub filter_range: Range<usize>,
 }
 
-#[derive(Clone, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodeLabelBuilder {
+    /// The text to display.
+    text: String,
+    /// Syntax highlighting runs.
+    runs: Vec<(Range<usize>, HighlightId)>,
+    /// The portion of the text that should be used in fuzzy filtering.
+    filter_range: Range<usize>,
+}
+
+#[derive(Clone, Deserialize, JsonSchema, Debug)]
 pub struct LanguageConfig {
     /// Human-readable name of the language.
     pub name: LanguageName,
@@ -760,6 +777,7 @@ pub struct LanguageConfig {
     pub hard_tabs: Option<bool>,
     /// How many columns a tab should occupy.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 128))]
     pub tab_size: Option<NonZeroU32>,
     /// How to soft-wrap long lines of text.
     #[serde(default)]
@@ -781,9 +799,21 @@ pub struct LanguageConfig {
     /// A list of characters that Zed should treat as word characters for completion queries.
     #[serde(default)]
     pub completion_query_characters: HashSet<char>,
+    /// A list of characters that Zed should treat as word characters for linked edit operations.
+    #[serde(default)]
+    pub linked_edit_characters: HashSet<char>,
     /// A list of preferred debuggers for this language.
     #[serde(default)]
     pub debuggers: IndexSet<SharedString>,
+    /// A list of import namespace segments that aren't expected to appear in file paths. For
+    /// example, "super" and "crate" in Rust.
+    #[serde(default)]
+    pub ignored_import_segments: HashSet<Arc<str>>,
+    /// Regular expression that matches substrings to omit from import paths, to make the paths more
+    /// similar to how they are specified when imported. For example, "/mod\.rs$" or "/__init__\.py$".
+    #[serde(default, deserialize_with = "deserialize_regex")]
+    #[schemars(schema_with = "regex_json_schema")]
+    pub import_path_strip_regex: Option<Regex>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default, JsonSchema)]
@@ -811,7 +841,7 @@ pub struct LanguageMatcher {
 }
 
 /// The configuration for JSX tag auto-closing.
-#[derive(Clone, Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema, Debug)]
 pub struct JsxTagAutoCloseConfig {
     /// The name of the node for a opening tag
     pub open_tag_node_name: String,
@@ -853,6 +883,7 @@ pub struct BlockCommentConfig {
     /// A character to add as a prefix when a new line is added to a block comment.
     pub prefix: Arc<str>,
     /// A indent to add for prefix and end line upon new line.
+    #[schemars(range(min = 1, max = 128))]
     pub tab_size: u32,
 }
 
@@ -917,6 +948,8 @@ pub struct LanguageConfigOverride {
     #[serde(default)]
     pub completion_query_characters: Override<HashSet<char>>,
     #[serde(default)]
+    pub linked_edit_characters: Override<HashSet<char>>,
+    #[serde(default)]
     pub opt_into_language_servers: Vec<LanguageServerName>,
     #[serde(default)]
     pub prefer_label_for_snippet: Option<bool>,
@@ -975,7 +1008,10 @@ impl Default for LanguageConfig {
             hidden: false,
             jsx_tag_auto_close: None,
             completion_query_characters: Default::default(),
+            linked_edit_characters: Default::default(),
             debuggers: Default::default(),
+            ignored_import_segments: Default::default(),
+            import_path_strip_regex: None,
         }
     }
 }
@@ -1154,7 +1190,7 @@ pub struct Grammar {
     id: GrammarId,
     pub ts_language: tree_sitter::Language,
     pub(crate) error_query: Option<Query>,
-    pub(crate) highlights_query: Option<Query>,
+    pub highlights_config: Option<HighlightsConfig>,
     pub(crate) brackets_config: Option<BracketsConfig>,
     pub(crate) redactions_config: Option<RedactionConfig>,
     pub(crate) runnable_config: Option<RunnableConfig>,
@@ -1165,7 +1201,13 @@ pub struct Grammar {
     pub(crate) injection_config: Option<InjectionConfig>,
     pub(crate) override_config: Option<OverrideConfig>,
     pub(crate) debug_variables_config: Option<DebugVariablesConfig>,
+    pub(crate) imports_config: Option<ImportsConfig>,
     pub(crate) highlight_map: Mutex<HighlightMap>,
+}
+
+pub struct HighlightsConfig {
+    pub query: Query,
+    pub identifier_capture_indices: Vec<u32>,
 }
 
 struct IndentConfig {
@@ -1305,11 +1347,23 @@ struct BracketsConfig {
 #[derive(Clone, Debug, Default)]
 struct BracketsPatternConfig {
     newline_only: bool,
+    rainbow_exclude: bool,
 }
 
 pub struct DebugVariablesConfig {
     pub query: Query,
     pub objects_by_capture_ix: Vec<(u32, DebuggerTextObject)>,
+}
+
+pub struct ImportsConfig {
+    pub query: Query,
+    pub import_ix: u32,
+    pub name_ix: Option<u32>,
+    pub namespace_ix: Option<u32>,
+    pub source_ix: Option<u32>,
+    pub list_ix: Option<u32>,
+    pub wildcard_ix: Option<u32>,
+    pub alias_ix: Option<u32>,
 }
 
 impl Language {
@@ -1332,7 +1386,7 @@ impl Language {
             grammar: ts_language.map(|ts_language| {
                 Arc::new(Grammar {
                     id: GrammarId::new(),
-                    highlights_query: None,
+                    highlights_config: None,
                     brackets_config: None,
                     outline_config: None,
                     text_object_config: None,
@@ -1344,6 +1398,7 @@ impl Language {
                     runnable_config: None,
                     error_query: Query::new(&ts_language, "(ERROR) @error").ok(),
                     debug_variables_config: None,
+                    imports_config: None,
                     ts_language,
                     highlight_map: Default::default(),
                 })
@@ -1425,12 +1480,39 @@ impl Language {
                 .with_debug_variables_query(query.as_ref())
                 .context("Error loading debug variables query")?;
         }
+        if let Some(query) = queries.imports {
+            self = self
+                .with_imports_query(query.as_ref())
+                .context("Error loading imports query")?;
+        }
         Ok(self)
     }
 
     pub fn with_highlights_query(mut self, source: &str) -> Result<Self> {
         let grammar = self.grammar_mut()?;
-        grammar.highlights_query = Some(Query::new(&grammar.ts_language, source)?);
+        let query = Query::new(&grammar.ts_language, source)?;
+
+        let mut identifier_capture_indices = Vec::new();
+        for name in [
+            "variable",
+            "constant",
+            "constructor",
+            "function",
+            "function.method",
+            "function.method.call",
+            "function.special",
+            "property",
+            "type",
+            "type.interface",
+        ] {
+            identifier_capture_indices.extend(query.capture_index_for_name(name));
+        }
+
+        grammar.highlights_config = Some(HighlightsConfig {
+            query,
+            identifier_capture_indices,
+        });
+
         Ok(self)
     }
 
@@ -1571,6 +1653,45 @@ impl Language {
         Ok(self)
     }
 
+    pub fn with_imports_query(mut self, source: &str) -> Result<Self> {
+        let query = Query::new(&self.expect_grammar()?.ts_language, source)?;
+
+        let mut import_ix = 0;
+        let mut name_ix = None;
+        let mut namespace_ix = None;
+        let mut source_ix = None;
+        let mut list_ix = None;
+        let mut wildcard_ix = None;
+        let mut alias_ix = None;
+        if populate_capture_indices(
+            &query,
+            &self.config.name,
+            "imports",
+            &[],
+            &mut [
+                Capture::Required("import", &mut import_ix),
+                Capture::Optional("name", &mut name_ix),
+                Capture::Optional("namespace", &mut namespace_ix),
+                Capture::Optional("source", &mut source_ix),
+                Capture::Optional("list", &mut list_ix),
+                Capture::Optional("wildcard", &mut wildcard_ix),
+                Capture::Optional("alias", &mut alias_ix),
+            ],
+        ) {
+            self.grammar_mut()?.imports_config = Some(ImportsConfig {
+                query,
+                import_ix,
+                name_ix,
+                namespace_ix,
+                source_ix,
+                list_ix,
+                wildcard_ix,
+                alias_ix,
+            });
+        }
+        return Ok(self);
+    }
+
     pub fn with_brackets_query(mut self, source: &str) -> Result<Self> {
         let query = Query::new(&self.expect_grammar()?.ts_language, source)?;
         let mut open_capture_ix = 0;
@@ -1589,8 +1710,12 @@ impl Language {
                 .map(|ix| {
                     let mut config = BracketsPatternConfig::default();
                     for setting in query.property_settings(ix) {
-                        if setting.key.as_ref() == "newline.only" {
+                        let setting_key = setting.key.as_ref();
+                        if setting_key == "newline.only" {
                             config.newline_only = true
+                        }
+                        if setting_key == "rainbow.exclude" {
+                            config.rainbow_exclude = true
                         }
                     }
                     config
@@ -1856,7 +1981,10 @@ impl Language {
             let tree = grammar.parse_text(text, None);
             let captures =
                 SyntaxSnapshot::single_tree_captures(range.clone(), text, &tree, self, |grammar| {
-                    grammar.highlights_query.as_ref()
+                    grammar
+                        .highlights_config
+                        .as_ref()
+                        .map(|config| &config.query)
                 });
             let highlight_maps = vec![grammar.highlight_map()];
             let mut offset = 0;
@@ -1885,10 +2013,10 @@ impl Language {
 
     pub fn set_theme(&self, theme: &SyntaxTheme) {
         if let Some(grammar) = self.grammar.as_ref()
-            && let Some(highlights_query) = &grammar.highlights_query
+            && let Some(highlights_config) = &grammar.highlights_config
         {
             *grammar.highlight_map.lock() =
-                HighlightMap::new(highlights_query.capture_names(), theme);
+                HighlightMap::new(highlights_config.query.capture_names(), theme);
         }
     }
 
@@ -1979,6 +2107,15 @@ impl LanguageScope {
             self.config_override()
                 .map(|o| &o.completion_query_characters),
             Some(&self.language.config.completion_query_characters),
+        )
+    }
+
+    /// Returns a list of language-specific characters that are considered part of
+    /// identifiers during linked editing operations.
+    pub fn linked_edit_characters(&self) -> Option<&HashSet<char>> {
+        Override::as_option(
+            self.config_override().map(|o| &o.linked_edit_characters),
+            Some(&self.language.config.linked_edit_characters),
         )
     }
 
@@ -2103,14 +2240,47 @@ impl Grammar {
 
     pub fn highlight_id_for_name(&self, name: &str) -> Option<HighlightId> {
         let capture_id = self
-            .highlights_query
+            .highlights_config
             .as_ref()?
+            .query
             .capture_index_for_name(name)?;
         Some(self.highlight_map.lock().get(capture_id))
     }
 
     pub fn debug_variables_config(&self) -> Option<&DebugVariablesConfig> {
         self.debug_variables_config.as_ref()
+    }
+
+    pub fn imports_config(&self) -> Option<&ImportsConfig> {
+        self.imports_config.as_ref()
+    }
+}
+
+impl CodeLabelBuilder {
+    pub fn respan_filter_range(&mut self, filter_text: Option<&str>) {
+        self.filter_range = filter_text
+            .and_then(|filter| self.text.find(filter).map(|ix| ix..ix + filter.len()))
+            .unwrap_or(0..self.text.len());
+    }
+
+    pub fn push_str(&mut self, text: &str, highlight: Option<HighlightId>) {
+        let start_ix = self.text.len();
+        self.text.push_str(text);
+        if let Some(highlight) = highlight {
+            let end_ix = self.text.len();
+            self.runs.push((start_ix..end_ix, highlight));
+        }
+    }
+
+    pub fn build(mut self) -> CodeLabel {
+        if self.filter_range.end == 0 {
+            self.respan_filter_range(None);
+        }
+        CodeLabel {
+            text: self.text,
+            runs: self.runs,
+            filter_range: self.filter_range,
+        }
     }
 }
 
@@ -2177,22 +2347,38 @@ impl CodeLabel {
     }
 
     pub fn plain(text: String, filter_text: Option<&str>) -> Self {
-        let filter_range = filter_text
-            .and_then(|filter| text.find(filter).map(|ix| ix..ix + filter.len()))
-            .unwrap_or(0..text.len());
-        Self {
-            runs: Vec::new(),
-            filter_range,
-            text,
-        }
+        Self::filtered(text.clone(), text.len(), filter_text, Vec::new())
     }
 
-    pub fn push_str(&mut self, text: &str, highlight: Option<HighlightId>) {
-        let start_ix = self.text.len();
-        self.text.push_str(text);
-        let end_ix = self.text.len();
-        if let Some(highlight) = highlight {
-            self.runs.push((start_ix..end_ix, highlight));
+    pub fn filtered(
+        text: String,
+        label_len: usize,
+        filter_text: Option<&str>,
+        runs: Vec<(Range<usize>, HighlightId)>,
+    ) -> Self {
+        assert!(label_len <= text.len());
+        let filter_range = filter_text
+            .and_then(|filter| text.find(filter).map(|ix| ix..ix + filter.len()))
+            .unwrap_or(0..label_len);
+        Self::new(text, filter_range, runs)
+    }
+
+    pub fn new(
+        text: String,
+        filter_range: Range<usize>,
+        runs: Vec<(Range<usize>, HighlightId)>,
+    ) -> Self {
+        assert!(
+            text.get(filter_range.clone()).is_some(),
+            "invalid filter range"
+        );
+        runs.iter().for_each(|(range, _)| {
+            assert!(text.get(range.clone()).is_some(), "invalid run range");
+        });
+        Self {
+            runs,
+            filter_range,
+            text,
         }
     }
 
@@ -2428,10 +2614,80 @@ pub fn range_from_lsp(range: lsp::Range) -> Range<Unclipped<PointUtf16>> {
     let mut start = point_from_lsp(range.start);
     let mut end = point_from_lsp(range.end);
     if start > end {
-        log::warn!("range_from_lsp called with inverted range {start:?}-{end:?}");
+        // We debug instead of warn so that this is not logged by default unless explicitly requested.
+        // Using warn would write to the log file, and since we receive an enormous amount of
+        // range_from_lsp calls (especially during completions), that can hang the main thread.
+        //
+        // See issue #36223.
+        zlog::debug!("range_from_lsp called with inverted range {start:?}-{end:?}");
         mem::swap(&mut start, &mut end);
     }
     start..end
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
+pub fn rust_lang() -> Arc<Language> {
+    use std::borrow::Cow;
+
+    let language = Language::new(
+        LanguageConfig {
+            name: "Rust".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["rs".to_string()],
+                ..Default::default()
+            },
+            line_comments: vec!["// ".into(), "/// ".into(), "//! ".into()],
+            ..Default::default()
+        },
+        Some(tree_sitter_rust::LANGUAGE.into()),
+    )
+    .with_queries(LanguageQueries {
+        outline: Some(Cow::from(include_str!(
+            "../../languages/src/rust/outline.scm"
+        ))),
+        indents: Some(Cow::from(include_str!(
+            "../../languages/src/rust/indents.scm"
+        ))),
+        brackets: Some(Cow::from(include_str!(
+            "../../languages/src/rust/brackets.scm"
+        ))),
+        text_objects: Some(Cow::from(include_str!(
+            "../../languages/src/rust/textobjects.scm"
+        ))),
+        ..LanguageQueries::default()
+    })
+    .expect("Could not parse queries");
+    Arc::new(language)
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
+pub fn markdown_lang() -> Arc<Language> {
+    use std::borrow::Cow;
+
+    let language = Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["md".into()],
+                ..Default::default()
+            },
+            ..LanguageConfig::default()
+        },
+        Some(tree_sitter_md::LANGUAGE.into()),
+    )
+    .with_queries(LanguageQueries {
+        brackets: Some(Cow::from(include_str!(
+            "../../languages/src/markdown/brackets.scm"
+        ))),
+        injections: Some(Cow::from(include_str!(
+            "../../languages/src/markdown/injections.scm"
+        ))),
+        ..LanguageQueries::default()
+    })
+    .expect("Could not parse markdown queries");
+    Arc::new(language)
 }
 
 #[cfg(test)]

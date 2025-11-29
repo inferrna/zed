@@ -1,5 +1,5 @@
 mod native_kernel;
-use std::{fmt::Debug, future::Future, path::PathBuf, sync::Arc};
+use std::{fmt::Debug, future::Future, path::PathBuf};
 
 use futures::{
     channel::mpsc::{self, Receiver},
@@ -18,6 +18,7 @@ use anyhow::Result;
 use jupyter_protocol::JupyterKernelspec;
 use runtimelib::{ExecutionState, JupyterMessage, KernelInfoReply};
 use ui::{Icon, IconName, SharedString};
+use util::rel_path::RelPath;
 
 pub type JupyterMessageChannel = stream::SelectAll<Receiver<JupyterMessage>>;
 
@@ -47,8 +48,8 @@ impl KernelSpecification {
 
     pub fn path(&self) -> SharedString {
         SharedString::from(match self {
-            Self::Jupyter(spec) => spec.path.to_string_lossy().to_string(),
-            Self::PythonEnv(spec) => spec.path.to_string_lossy().to_string(),
+            Self::Jupyter(spec) => spec.path.to_string_lossy().into_owned(),
+            Self::PythonEnv(spec) => spec.path.to_string_lossy().into_owned(),
             Self::Remote(spec) => spec.url.to_string(),
         })
     }
@@ -84,7 +85,7 @@ pub fn python_env_kernel_specifications(
     let toolchains = project.read(cx).available_toolchains(
         ProjectPath {
             worktree_id,
-            path: Arc::from("".as_ref()),
+            path: RelPath::empty().into(),
         },
         python_language,
         cx,
@@ -212,6 +213,13 @@ impl From<&Kernel> for KernelStatus {
             Kernel::RunningKernel(kernel) => match kernel.execution_state() {
                 ExecutionState::Idle => KernelStatus::Idle,
                 ExecutionState::Busy => KernelStatus::Busy,
+                ExecutionState::Unknown => KernelStatus::Error,
+                ExecutionState::Starting => KernelStatus::Starting,
+                ExecutionState::Restarting => KernelStatus::Restarting,
+                ExecutionState::Terminating => KernelStatus::ShuttingDown,
+                ExecutionState::AutoRestarting => KernelStatus::Restarting,
+                ExecutionState::Dead => KernelStatus::Error,
+                ExecutionState::Other(_) => KernelStatus::Error,
             },
             Kernel::StartingKernel(_) => KernelStatus::Starting,
             Kernel::ErroredLaunch(_) => KernelStatus::Error,

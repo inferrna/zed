@@ -12,16 +12,14 @@ use crate::{
 use anyhow::{Context as _, Result, anyhow};
 use collections::IndexMap;
 use dap::adapters::DebugAdapterName;
-use dap::debugger_settings::DebugPanelDockPosition;
 use dap::{DapRegistry, StartDebuggingRequestArguments};
 use dap::{client::SessionId, debugger_settings::DebuggerSettings};
-use editor::Editor;
+use editor::{Editor, MultiBufferOffset, ToPoint};
 use gpui::{
     Action, App, AsyncWindowContext, ClipboardItem, Context, DismissEvent, Entity, EntityId,
     EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, Point, Subscription, Task,
     WeakEntity, anchored, deferred,
 };
-use text::ToPoint as _;
 
 use itertools::Itertools as _;
 use language::Buffer;
@@ -34,6 +32,7 @@ use std::sync::{Arc, LazyLock};
 use task::{DebugScenario, TaskContext};
 use tree_sitter::{Query, StreamingIterator as _};
 use ui::{ContextMenu, Divider, PopoverMenuHandle, Tab, Tooltip, prelude::*};
+use util::rel_path::RelPath;
 use util::{ResultExt, debug_panic, maybe};
 use workspace::SplitDirection;
 use workspace::item::SaveOptions;
@@ -42,6 +41,8 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 use zed_actions::ToggleFocus;
+
+const DEBUG_PANEL_KEY: &str = "DebugPanel";
 
 pub struct DebugPanel {
     size: Pixels,
@@ -133,6 +134,10 @@ impl DebugPanel {
     pub(crate) fn running_state(&self, cx: &mut App) -> Option<Entity<RunningState>> {
         self.active_session()
             .map(|session| session.read(cx).running_state().clone())
+    }
+
+    pub fn project(&self) -> &Entity<Project> {
+        &self.project
     }
 
     pub fn load(
@@ -264,12 +269,12 @@ impl DebugPanel {
 
             async move |_, cx| {
                 if let Err(error) = task.await {
-                    log::error!("{error}");
+                    log::error!("{error:#}");
                     session
                         .update(cx, |session, cx| {
                             session
                                 .console_output(cx)
-                                .unbounded_send(format!("error: {}", error))
+                                .unbounded_send(format!("error: {:#}", error))
                                 .ok();
                             session.shutdown(cx)
                         })?
@@ -610,16 +615,24 @@ impl DebugPanel {
                 })
                 .tooltip({
                     let focus_handle = focus_handle.clone();
-                    move |window, cx| {
+                    move |_window, cx| {
                         Tooltip::for_action_in(
                             "Start Debug Session",
                             &crate::Start,
                             &focus_handle,
-                            window,
                             cx,
                         )
                     }
                 })
+        };
+
+        let edit_debug_json_button = || {
+            IconButton::new("debug-edit-debug-json", IconName::Code)
+                .icon_size(IconSize::Small)
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(zed_actions::OpenProjectDebugTasks.boxed_clone(), cx);
+                })
+                .tooltip(Tooltip::text("Edit debug.json"))
         };
 
         let documentation_button = || {
@@ -638,6 +651,17 @@ impl DebugPanel {
                 .tooltip(Tooltip::text("Open Debug Adapter Logs"))
         };
 
+        let close_bottom_panel_button = {
+            h_flex().pl_0p5().gap_1().child(Divider::vertical()).child(
+                IconButton::new("debug-close-panel", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(workspace::ToggleBottomDock.boxed_clone(), cx)
+                    })
+                    .tooltip(Tooltip::text("Close Panel")),
+            )
+        };
+
         Some(
             div.w_full()
                 .py_1()
@@ -645,7 +669,7 @@ impl DebugPanel {
                 .justify_between()
                 .border_b_1()
                 .border_color(cx.theme().colors().border)
-                .when(is_side, |this| this.gap_1())
+                .when(is_side, |this| this.gap_1().h(Tab::container_height(cx)))
                 .child(
                     h_flex()
                         .justify_between()
@@ -679,12 +703,11 @@ impl DebugPanel {
                                                 ))
                                                 .tooltip({
                                                     let focus_handle = focus_handle.clone();
-                                                    move |window, cx| {
+                                                    move |_window, cx| {
                                                         Tooltip::for_action_in(
                                                             "Pause Program",
                                                             &Pause,
                                                             &focus_handle,
-                                                            window,
                                                             cx,
                                                         )
                                                     }
@@ -704,12 +727,11 @@ impl DebugPanel {
                                                 .disabled(thread_status != ThreadStatus::Stopped)
                                                 .tooltip({
                                                     let focus_handle = focus_handle.clone();
-                                                    move |window, cx| {
+                                                    move |_window, cx| {
                                                         Tooltip::for_action_in(
                                                             "Continue Program",
                                                             &Continue,
                                                             &focus_handle,
-                                                            window,
                                                             cx,
                                                         )
                                                     }
@@ -729,12 +751,11 @@ impl DebugPanel {
                                             .disabled(thread_status != ThreadStatus::Stopped)
                                             .tooltip({
                                                 let focus_handle = focus_handle.clone();
-                                                move |window, cx| {
+                                                move |_window, cx| {
                                                     Tooltip::for_action_in(
                                                         "Step Over",
                                                         &StepOver,
                                                         &focus_handle,
-                                                        window,
                                                         cx,
                                                     )
                                                 }
@@ -755,12 +776,11 @@ impl DebugPanel {
                                         .disabled(thread_status != ThreadStatus::Stopped)
                                         .tooltip({
                                             let focus_handle = focus_handle.clone();
-                                            move |window, cx| {
+                                            move |_window, cx| {
                                                 Tooltip::for_action_in(
                                                     "Step In",
                                                     &StepInto,
                                                     &focus_handle,
-                                                    window,
                                                     cx,
                                                 )
                                             }
@@ -778,12 +798,11 @@ impl DebugPanel {
                                             .disabled(thread_status != ThreadStatus::Stopped)
                                             .tooltip({
                                                 let focus_handle = focus_handle.clone();
-                                                move |window, cx| {
+                                                move |_window, cx| {
                                                     Tooltip::for_action_in(
                                                         "Step Out",
                                                         &StepOut,
                                                         &focus_handle,
-                                                        window,
                                                         cx,
                                                     )
                                                 }
@@ -801,12 +820,11 @@ impl DebugPanel {
                                             ))
                                             .tooltip({
                                                 let focus_handle = focus_handle.clone();
-                                                move |window, cx| {
+                                                move |_window, cx| {
                                                     Tooltip::for_action_in(
                                                         "Rerun Session",
                                                         &RerunSession,
                                                         &focus_handle,
-                                                        window,
                                                         cx,
                                                     )
                                                 }
@@ -846,12 +864,11 @@ impl DebugPanel {
                                                 } else {
                                                     "Terminate All Threads"
                                                 };
-                                                move |window, cx| {
+                                                move |_window, cx| {
                                                     Tooltip::for_action_in(
                                                         label,
                                                         &Stop,
                                                         &focus_handle,
-                                                        window,
                                                         cx,
                                                     )
                                                 }
@@ -878,12 +895,11 @@ impl DebugPanel {
                                                 ))
                                                 .tooltip({
                                                     let focus_handle = focus_handle.clone();
-                                                    move |window, cx| {
+                                                    move |_window, cx| {
                                                         Tooltip::for_action_in(
                                                             "Detach",
                                                             &Detach,
                                                             &focus_handle,
-                                                            window,
                                                             cx,
                                                         )
                                                     }
@@ -896,8 +912,9 @@ impl DebugPanel {
                         )
                         .when(is_side, |this| {
                             this.child(new_session_button())
-                                .child(logs_button())
+                                .child(edit_debug_json_button())
                                 .child(documentation_button())
+                                .child(logs_button())
                         }),
                 )
                 .child(
@@ -948,8 +965,10 @@ impl DebugPanel {
                                 ))
                                 .when(!is_side, |this| {
                                     this.child(new_session_button())
-                                        .child(logs_button())
+                                        .child(edit_debug_json_button())
                                         .child(documentation_button())
+                                        .child(logs_button())
+                                        .child(close_bottom_panel_button)
                                 }),
                         ),
                 ),
@@ -1047,14 +1066,14 @@ impl DebugPanel {
                 directory_in_worktree: dir,
                 ..
             } => {
-                let relative_path = if dir.ends_with(".vscode") {
-                    dir.join("launch.json")
+                let relative_path = if dir.ends_with(RelPath::unix(".vscode").unwrap()) {
+                    dir.join(RelPath::unix("launch.json").unwrap())
                 } else {
-                    dir.join("debug.json")
+                    dir.join(RelPath::unix("debug.json").unwrap())
                 };
                 ProjectPath {
                     worktree_id: id,
-                    path: Arc::from(relative_path),
+                    path: relative_path,
                 }
             }
             _ => return self.save_scenario(scenario, worktree_id, window, cx),
@@ -1115,13 +1134,13 @@ impl DebugPanel {
                     let fs =
                         workspace.read_with(cx, |workspace, _| workspace.app_state().fs.clone())?;
 
-                    path.push(paths::local_settings_folder_relative_path());
+                    path.push(paths::local_settings_folder_name());
                     if !fs.is_dir(path.as_path()).await {
                         fs.create_dir(path.as_path()).await?;
                     }
                     path.pop();
 
-                    path.push(paths::local_debug_file_relative_path());
+                    path.push(paths::local_debug_file_relative_path().as_std_path());
                     let path = path.as_path();
 
                     if !fs.is_file(path).await {
@@ -1208,11 +1227,11 @@ impl DebugPanel {
         let mut last_offset = None;
         while let Some(mat) = matches.next() {
             if let Some(pos) = mat.captures.first().map(|m| m.node.byte_range().end) {
-                last_offset = Some(pos)
+                last_offset = Some(MultiBufferOffset(pos))
             }
         }
         let mut edits = Vec::new();
-        let mut cursor_position = 0;
+        let mut cursor_position = MultiBufferOffset(0);
 
         if let Some(pos) = last_offset {
             edits.push((pos..pos, format!(",\n{new_scenario}")));
@@ -1226,24 +1245,25 @@ impl DebugPanel {
 
             if let Some(mat) = matches.next() {
                 if let Some(pos) = mat.captures.first().map(|m| m.node.byte_range().end - 1) {
-                    edits.push((pos..pos, format!("\n{new_scenario}\n")));
-                    cursor_position = pos + "\n  ".len();
+                    edits.push((
+                        MultiBufferOffset(pos)..MultiBufferOffset(pos),
+                        format!("\n{new_scenario}\n"),
+                    ));
+                    cursor_position = MultiBufferOffset(pos) + "\n  ".len();
                 }
             } else {
-                edits.push((0..0, format!("[\n{}\n]", new_scenario)));
-                cursor_position = "[\n  ".len();
+                edits.push((
+                    MultiBufferOffset(0)..MultiBufferOffset(0),
+                    format!("[\n{}\n]", new_scenario),
+                ));
+                cursor_position = MultiBufferOffset("[\n  ".len());
             }
         }
         editor.transact(window, cx, |editor, window, cx| {
             editor.edit(edits, cx);
-            let snapshot = editor
-                .buffer()
-                .read(cx)
-                .as_singleton()
-                .unwrap()
-                .read(cx)
-                .snapshot();
+            let snapshot = editor.buffer().read(cx).read(cx);
             let point = cursor_position.to_point(&snapshot);
+            drop(snapshot);
             editor.go_to_singleton_buffer_point(point, window, cx);
         });
         Ok(editor.save(SaveOptions::default(), project, window, cx))
@@ -1399,12 +1419,12 @@ impl Panel for DebugPanel {
         "DebugPanel"
     }
 
+    fn panel_key() -> &'static str {
+        DEBUG_PANEL_KEY
+    }
+
     fn position(&self, _window: &Window, cx: &App) -> DockPosition {
-        match DebuggerSettings::get_global(cx).dock {
-            DebugPanelDockPosition::Left => DockPosition::Left,
-            DebugPanelDockPosition::Bottom => DockPosition::Bottom,
-            DebugPanelDockPosition::Right => DockPosition::Right,
-        }
+        DebuggerSettings::get_global(cx).dock.into()
     }
 
     fn position_is_valid(&self, _: DockPosition) -> bool {
@@ -1426,18 +1446,9 @@ impl Panel for DebugPanel {
             });
         }
 
-        settings::update_settings_file::<DebuggerSettings>(
-            self.fs.clone(),
-            cx,
-            move |settings, _| {
-                let dock = match position {
-                    DockPosition::Left => DebugPanelDockPosition::Left,
-                    DockPosition::Bottom => DebugPanelDockPosition::Bottom,
-                    DockPosition::Right => DebugPanelDockPosition::Right,
-                };
-                settings.dock = dock;
-            },
-        );
+        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
+            settings.debugger.get_or_insert_default().dock = Some(position.into());
+        });
     }
 
     fn size(&self, _window: &Window, _: &App) -> Pixels {
@@ -1693,7 +1704,7 @@ impl Render for DebugPanel {
                         .child(
                             Button::new("spawn-new-session-empty-state", "New Session")
                                 .icon(IconName::Plus)
-                                .icon_size(IconSize::XSmall)
+                                .icon_size(IconSize::Small)
                                 .icon_color(Color::Muted)
                                 .icon_position(IconPosition::Start)
                                 .on_click(|_, window, cx| {
@@ -1703,8 +1714,7 @@ impl Render for DebugPanel {
                         .child(
                             Button::new("edit-debug-settings", "Edit debug.json")
                                 .icon(IconName::Code)
-                                .icon_size(IconSize::XSmall)
-                                .color(Color::Muted)
+                                .icon_size(IconSize::Small)
                                 .icon_color(Color::Muted)
                                 .icon_position(IconPosition::Start)
                                 .on_click(|_, window, cx| {
@@ -1717,8 +1727,7 @@ impl Render for DebugPanel {
                         .child(
                             Button::new("open-debugger-docs", "Debugger Docs")
                                 .icon(IconName::Book)
-                                .color(Color::Muted)
-                                .icon_size(IconSize::XSmall)
+                                .icon_size(IconSize::Small)
                                 .icon_color(Color::Muted)
                                 .icon_position(IconPosition::Start)
                                 .on_click(|_, _, cx| cx.open_url("https://zed.dev/docs/debugger")),
@@ -1729,8 +1738,7 @@ impl Render for DebugPanel {
                                 "Debugger Extensions",
                             )
                             .icon(IconName::Blocks)
-                            .color(Color::Muted)
-                            .icon_size(IconSize::XSmall)
+                            .icon_size(IconSize::Small)
                             .icon_color(Color::Muted)
                             .icon_position(IconPosition::Start)
                             .on_click(|_, window, cx| {
@@ -1746,6 +1754,15 @@ impl Render for DebugPanel {
                                 );
                             }),
                         );
+
+                    let has_breakpoints = self
+                        .project
+                        .read(cx)
+                        .breakpoint_store()
+                        .read(cx)
+                        .all_source_breakpoints(cx)
+                        .values()
+                        .any(|breakpoints| !breakpoints.is_empty());
 
                     let breakpoint_list = v_flex()
                         .group("base-breakpoint-list")
@@ -1770,11 +1787,23 @@ impl Render for DebugPanel {
                                     ),
                                 ),
                         )
-                        .child(self.breakpoint_list.clone());
+                        .when(has_breakpoints, |this| {
+                            this.child(self.breakpoint_list.clone())
+                        })
+                        .when(!has_breakpoints, |this| {
+                            this.child(
+                                v_flex().size_full().items_center().justify_center().child(
+                                    Label::new("No Breakpoints Set")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                            )
+                        });
 
                     this.child(
                         v_flex()
                             .size_full()
+                            .overflow_hidden()
                             .gap_1()
                             .items_center()
                             .justify_center()

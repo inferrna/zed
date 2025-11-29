@@ -22,7 +22,7 @@ use sea_orm::{
     entity::prelude::*,
     sea_query::{Alias, Expr, OnConflict},
 };
-use semantic_version::SemanticVersion;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::{
@@ -34,6 +34,7 @@ use std::{
 };
 use time::PrimitiveDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard};
+use util::paths::PathStyle;
 use worktree_settings_file::LocalSettingsKind;
 
 #[cfg(test)]
@@ -598,6 +599,7 @@ pub struct Project {
     pub worktrees: BTreeMap<u64, Worktree>,
     pub repositories: Vec<proto::UpdateRepository>,
     pub language_servers: Vec<LanguageServer>,
+    pub path_style: PathStyle,
 }
 
 pub struct ProjectCollaborator {
@@ -669,7 +671,7 @@ pub struct NewExtensionVersion {
 
 pub struct ExtensionVersionConstraints {
     pub schema_versions: RangeInclusive<i32>,
-    pub wasm_api_versions: RangeInclusive<SemanticVersion>,
+    pub wasm_api_versions: RangeInclusive<semver::Version>,
 }
 
 impl LocalSettingsKind {

@@ -1,8 +1,9 @@
 use std::ops::{Deref, DerefMut};
 
 use editor::test::editor_lsp_test_context::EditorLspTestContext;
-use gpui::{Context, Entity, SemanticVersion, UpdateGlobal};
+use gpui::{Context, Entity, UpdateGlobal};
 use search::{BufferSearchBar, project_search::ProjectSearchBar};
+use semver::Version;
 
 use crate::{state::Operator, *};
 
@@ -19,17 +20,14 @@ impl VimTestContext {
         cx.update(|cx| {
             let settings = SettingsStore::test(cx);
             cx.set_global(settings);
-            release_channel::init(SemanticVersion::default(), cx);
+            release_channel::init(Version::new(0, 0, 0), cx);
             command_palette::init(cx);
             project_panel::init(cx);
             git_ui::init(cx);
             crate::init(cx);
             search::init(cx);
-            workspace::init_settings(cx);
-            language::init(cx);
-            editor::init_settings(cx);
-            project::Project::init_settings(cx);
             theme::init(theme::LoadThemes::JustBase, cx);
+            settings_ui::init(cx);
         });
     }
 
@@ -44,10 +42,38 @@ impl VimTestContext {
         Self::new_with_lsp(EditorLspTestContext::new_html(cx).await, true)
     }
 
+    pub async fn new_markdown_with_rust(cx: &mut gpui::TestAppContext) -> VimTestContext {
+        Self::init(cx);
+        Self::new_with_lsp(EditorLspTestContext::new_markdown_with_rust(cx).await, true)
+    }
+
     pub async fn new_typescript(cx: &mut gpui::TestAppContext) -> VimTestContext {
         Self::init(cx);
         Self::new_with_lsp(
             EditorLspTestContext::new_typescript(
+                lsp::ServerCapabilities {
+                    completion_provider: Some(lsp::CompletionOptions {
+                        trigger_characters: Some(vec![".".to_string()]),
+                        ..Default::default()
+                    }),
+                    rename_provider: Some(lsp::OneOf::Right(lsp::RenameOptions {
+                        prepare_provider: Some(true),
+                        work_done_progress_options: Default::default(),
+                    })),
+                    definition_provider: Some(lsp::OneOf::Left(true)),
+                    ..Default::default()
+                },
+                cx,
+            )
+            .await,
+            true,
+        )
+    }
+
+    pub async fn new_tsx(cx: &mut gpui::TestAppContext) -> VimTestContext {
+        Self::init(cx);
+        Self::new_with_lsp(
+            EditorLspTestContext::new_tsx(
                 lsp::ServerCapabilities {
                     completion_provider: Some(lsp::CompletionOptions {
                         trigger_characters: Some(vec![".".to_string()]),
@@ -68,7 +94,7 @@ impl VimTestContext {
 
     pub fn init_keybindings(enabled: bool, cx: &mut App) {
         SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings::<VimModeSetting>(cx, |s| s.vim_mode = Some(enabled));
+            store.update_user_settings(cx, |s| s.vim_mode = Some(enabled));
         });
         let mut default_key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
             "keymaps/default-macos.json",
@@ -137,7 +163,7 @@ impl VimTestContext {
     pub fn enable_vim(&mut self) {
         self.cx.update(|_, cx| {
             SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings::<VimModeSetting>(cx, |s| s.vim_mode = Some(true));
+                store.update_user_settings(cx, |s| s.vim_mode = Some(true));
             });
         })
     }
@@ -145,7 +171,7 @@ impl VimTestContext {
     pub fn disable_vim(&mut self) {
         self.cx.update(|_, cx| {
             SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings::<VimModeSetting>(cx, |s| s.vim_mode = Some(false));
+                store.update_user_settings(cx, |s| s.vim_mode = Some(false));
             });
         })
     }
@@ -153,9 +179,7 @@ impl VimTestContext {
     pub fn enable_helix(&mut self) {
         self.cx.update(|_, cx| {
             SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings::<vim_mode_setting::HelixModeSetting>(cx, |s| {
-                    s.helix_mode = Some(true)
-                });
+                store.update_user_settings(cx, |s| s.helix_mode = Some(true));
             });
         })
     }

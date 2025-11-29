@@ -154,6 +154,14 @@ This query identifies opening and closing brackets, braces, and quotation marks.
 | @open   | Captures opening brackets, braces, and quotes |
 | @close  | Captures closing brackets, braces, and quotes |
 
+Zed uses these to highlight matching brackets: painting each bracket pair with a different color ("rainbow brackets") and highlighting the brackets if the cursor is inside the bracket pair.
+
+To opt out of rainbow brackets colorization, add the following to the corresponding `brackets.scm` entry:
+
+```scheme
+(("\"" @open "\"" @close) (#set! rainbow.exclude))
+```
+
 ### Code outline/structure
 
 The `outline.scm` file defines the structure for the code outline.
@@ -324,7 +332,7 @@ This query marks number and string values in key-value pairs and arrays for reda
 
 The `runnables.scm` file defines rules for detecting runnable code.
 
-Here's an example from an `runnables.scm` file for JSON:
+Here's an example from a `runnables.scm` file for JSON:
 
 ```scheme
 (
@@ -366,7 +374,7 @@ TBD: `#set! tag`
 
 Zed uses the [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) to provide advanced language support.
 
-An extension may provide any number of language servers. To provide a language server from your extension, add an entry to your `extension.toml` with the name of your language server and the language(s) it applies to:
+An extension may provide any number of language servers. To provide a language server from your extension, add an entry to your `extension.toml` with the name of your language server and the language(s) it applies to. The entry in the list of `languages` has to match the `name` field from the `config.toml` file for that language:
 
 ```toml
 [language_servers.my-language-server]

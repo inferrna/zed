@@ -6,18 +6,20 @@ pub mod test;
 pub mod transport;
 pub mod types;
 
+use collections::HashMap;
+use http_client::HttpClient;
 use std::path::Path;
 use std::sync::Arc;
 use std::{fmt::Display, path::PathBuf};
 
 use anyhow::Result;
 use client::Client;
-use collections::HashMap;
 use gpui::AsyncApp;
 use parking_lot::RwLock;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use util::redact::should_redact;
+pub use settings::ContextServerCommand;
+use url::Url;
+
+use crate::transport::HttpTransport;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContextServerId(pub Arc<str>);
@@ -25,32 +27,6 @@ pub struct ContextServerId(pub Arc<str>);
 impl Display for ContextServerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, PartialEq, Eq, JsonSchema)]
-pub struct ContextServerCommand {
-    #[serde(rename = "command")]
-    pub path: PathBuf,
-    pub args: Vec<String>,
-    pub env: Option<HashMap<String, String>>,
-    /// Timeout for tool calls in milliseconds. Defaults to 60000 (60 seconds) if not specified.
-    pub timeout: Option<u64>,
-}
-
-impl std::fmt::Debug for ContextServerCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let filtered_env = self.env.as_ref().map(|env| {
-            env.iter()
-                .map(|(k, v)| (k, if should_redact(k) { "[REDACTED]" } else { v }))
-                .collect::<Vec<_>>()
-        });
-
-        f.debug_struct("ContextServerCommand")
-            .field("path", &self.path)
-            .field("args", &self.args)
-            .field("env", &filtered_env)
-            .finish()
     }
 }
 
@@ -79,6 +55,25 @@ impl ContextServer {
                 working_directory.map(|directory| directory.to_path_buf()),
             ),
         }
+    }
+
+    pub fn http(
+        id: ContextServerId,
+        endpoint: &Url,
+        headers: HashMap<String, String>,
+        http_client: Arc<dyn HttpClient>,
+        executor: gpui::BackgroundExecutor,
+    ) -> Result<Self> {
+        let transport = match endpoint.scheme() {
+            "http" | "https" => {
+                log::info!("Using HTTP transport for {}", endpoint);
+                let transport =
+                    HttpTransport::new(http_client, endpoint.to_string(), headers, executor);
+                Arc::new(transport) as _
+            }
+            _ => anyhow::bail!("unsupported MCP url scheme {}", endpoint.scheme()),
+        };
+        Ok(Self::new(id, transport))
     }
 
     pub fn new(id: ContextServerId, transport: Arc<dyn crate::transport::Transport>) -> Self {
