@@ -1,7 +1,7 @@
 use crate::{
     Bounds, DevicePixels, Font, FontFeatures, FontId, FontMetrics, FontRun, FontStyle, FontWeight,
     GlyphId, LineLayout, Pixels, PlatformTextSystem, Point, RenderGlyphParams, Rgba,
-    SUBPIXEL_VARIANTS, ShapedGlyph, ShapedRun, SharedString, Size, point, size,
+    SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString, Size, point, size,
 };
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
@@ -394,7 +394,7 @@ impl CosmicTextSystemState {
 
         let subpixel_shift = params
             .subpixel_variant
-            .map(|v| v as f32 / (SUBPIXEL_VARIANTS as f32 * params.scale_factor));
+            .map(|v| v as f32 / (SUBPIXEL_VARIANTS_X as f32 * params.scale_factor));
 
         let h = glyph_bounds.size.height.0;
         let w = glyph_bounds.size.width.0;

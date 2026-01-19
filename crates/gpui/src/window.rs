@@ -3043,8 +3043,8 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
         let subpixel_variant = Point {
-            x: (origin.x.0.fract() * SUBPIXEL_VARIANTS as f32).floor() as u8,
-            y: (origin.y.0.fract() * SUBPIXEL_VARIANTS as f32).floor() as u8,
+            x: (origin.x.0.fract() * SUBPIXEL_VARIANTS_X as f32).floor() as u8,
+            y: (origin.y.0.fract() * SUBPIXEL_VARIANTS_X as f32).floor() as u8,
         };
 
         let scale_factor = self.scale_factor();
